@@ -1,0 +1,145 @@
+"""
+Pydantic models for the dual output fork: InvestmentMemo and ResearchReport.
+
+After the Synthesis Agent produces its analysis, the output fork generates
+two distinct documents:
+  - InvestmentMemo  — concise 1-page executive summary with recommendation
+  - ResearchReport  — detailed multi-section analyst report
+"""
+
+from datetime import datetime, timezone
+
+from pydantic import BaseModel, Field
+
+from schemas.agents import InvestmentRating
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Investment Memo — concise 1-page summary
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class InvestmentMemo(BaseModel):
+    """Concise investment memo (1-page executive summary).
+
+    Designed for quick consumption by portfolio managers and
+    investment committee members.
+    """
+
+    title: str = Field(..., description="Memo title, e.g. 'Apple Inc. (AAPL) — Buy'")
+    company_name: str = Field(..., description="Company name")
+    ticker: str = Field(default="", description="Stock ticker")
+    date: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="Date of memo generation",
+    )
+
+    # ── Recommendation ───────────────────────────────────────────────────────
+    rating: InvestmentRating = Field(..., description="Investment rating")
+    rating_rationale: str = Field(
+        ..., description="1-2 sentence rationale for the rating"
+    )
+
+    # ── Key sections ─────────────────────────────────────────────────────────
+    executive_summary: str = Field(
+        ..., description="Executive summary (2-3 paragraphs)"
+    )
+    key_metrics: str = Field(
+        ..., description="Bullet-point summary of critical financial metrics"
+    )
+    key_risks: str = Field(
+        ..., description="Top 3-5 risks in bullet-point format"
+    )
+    recent_news: str = Field(
+        ..., description="Brief summary of recent news/sentiment"
+    )
+    conclusion: str = Field(
+        ..., description="Final conclusion with actionable recommendation"
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Research Report — detailed multi-section report
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class ReportSection(BaseModel):
+    """A single section within the research report."""
+
+    title: str = Field(..., description="Section heading")
+    content: str = Field(..., description="Section body text (Markdown supported)")
+
+
+class ResearchReport(BaseModel):
+    """Detailed multi-section research analyst report.
+
+    Structured for export to PDF, DOCX, Excel, JSON, and Markdown.
+    """
+
+    title: str = Field(
+        ..., description="Report title, e.g. 'Apple Inc. — Equity Research Report'"
+    )
+    company_name: str = Field(..., description="Company name")
+    ticker: str = Field(default="", description="Stock ticker")
+    date: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="Date of report generation",
+    )
+    analyst: str = Field(
+        default="AI Financial Research Analyst",
+        description="Analyst attribution",
+    )
+
+    # ── Recommendation ───────────────────────────────────────────────────────
+    rating: InvestmentRating = Field(..., description="Investment rating")
+    rating_rationale: str = Field(
+        ..., description="Detailed rationale for the rating"
+    )
+
+    # ── Report body ──────────────────────────────────────────────────────────
+    executive_summary: str = Field(
+        ..., description="Executive summary (2-3 paragraphs)"
+    )
+    company_overview: str = Field(
+        ..., description="Company background, business model, competitive position"
+    )
+    financial_analysis: str = Field(
+        ..., description="Detailed financial metrics analysis"
+    )
+    risk_assessment: str = Field(
+        ..., description="Comprehensive risk analysis"
+    )
+    market_sentiment: str = Field(
+        ..., description="Recent news and market sentiment analysis"
+    )
+    investment_thesis: str = Field(
+        ..., description="Full investment thesis (bull/bear case)"
+    )
+
+    # ── Structured data ──────────────────────────────────────────────────────
+    strengths: list[str] = Field(
+        default_factory=list, description="Key strengths"
+    )
+    weaknesses: list[str] = Field(
+        default_factory=list, description="Key weaknesses"
+    )
+    catalysts: list[str] = Field(
+        default_factory=list, description="Upcoming catalysts"
+    )
+    additional_sections: list[ReportSection] = Field(
+        default_factory=list,
+        description="Any additional sections appended to the report",
+    )
+
+    # ── Conclusion ───────────────────────────────────────────────────────────
+    conclusion: str = Field(
+        ..., description="Final conclusion and recommendation"
+    )
+    disclaimer: str = Field(
+        default=(
+            "This report was generated by an AI-powered financial research analyst. "
+            "It is for informational purposes only and does not constitute financial advice. "
+            "Always consult a qualified financial advisor before making investment decisions."
+        ),
+        description="Legal disclaimer",
+    )
