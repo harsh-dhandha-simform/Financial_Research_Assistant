@@ -1,13 +1,18 @@
 """
 Embedding model with automatic fallback chain.
 
-Priority order (tries each until one succeeds):
-    1. OpenAI text-embedding-3-large (3072 dims, best quality)
-    2. OpenAI text-embedding-3-small (1536 dims, cheaper fallback)
-    3. BAAI/bge-base-en-v1.5 (768 dims, local HF model)
-    4. nomic-ai/nomic-embed-text-v1.5 (768 dims, local HF model)
+Uses inference APIs where possible (no downloads) with local fallback.
 
-Uses the API_KEY and BASE_URL from .env for OpenAI-compatible endpoints.
+Priority order (tries each until one succeeds):
+    1. Voyage voyage-4        (1024 dims, Voyage API)
+    2. BAAI/bge-m3            (1024 dims, HuggingFace Inference API)
+    3. Qwen3-Embedding-0.6B   (1024 dims, local sentence-transformers)
+    4. nomic-embed-text-v1.5  (768 dims, Nomic Atlas API)
+    5. OpenAI text-embedding-3-large (3072 dims, OpenAI-compat API)
+    6. OpenAI text-embedding-3-small (1536 dims, OpenAI-compat API)
+
+First 3 models all produce 1024-dim embeddings — ideal for Qdrant consistency.
+Models 4-6 have different dimensions and serve as last-resort fallbacks.
 
 Usage:
     from retrieval.embedding import get_embedding_model, embed_texts, embed_query
@@ -27,17 +32,205 @@ logger = logging.getLogger(__name__)
 
 
 # ── Fallback chain configuration ─────────────────────────────────────────────
+# Primary models (1-3) all produce 1024-dim for Qdrant consistency.
+# Fallback models (4-6) have different dims — will need a separate collection.
 # Each entry: (name, provider, model_id, dimensions)
 EMBEDDING_CHAIN: list[tuple[str, str, str, int]] = [
+    # ── Primary: 1024-dim models ──
+    ("Voyage voyage-4", "voyage", "voyage-4", 1024),
+    ("BAAI/bge-m3", "hf_inference", "BAAI/bge-m3", 1024),
+    ("Qwen3-Embedding-0.6B", "hf_local", "Qwen/Qwen3-Embedding-0.6B", 1024),
+    # ── Fallback: different dimensions ──
+    ("nomic-embed-text-v1.5", "nomic", "nomic-embed-text-v1.5", 768),
     ("OpenAI text-embedding-3-large", "openai", "text-embedding-3-large", 3072),
     ("OpenAI text-embedding-3-small", "openai", "text-embedding-3-small", 1536),
-    ("BAAI/bge-base-en-v1.5", "huggingface", "BAAI/bge-base-en-v1.5", 768),
-    ("nomic-ai/nomic-embed-text-v1.5", "huggingface", "nomic-ai/nomic-embed-text-v1.5", 768),
 ]
 
 # Cached model info after successful initialization
 _active_model_name: str = ""
 _active_dimensions: int = 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Custom LangChain Embeddings wrappers for API-based providers
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class HuggingFaceInferenceEmbeddings(Embeddings):
+    """LangChain-compatible wrapper for HuggingFace Inference API.
+
+    Uses the HuggingFace serverless Inference API — no local model download.
+    Requires HF_TOKEN with access to inference providers.
+    """
+
+    def __init__(self, model_id: str, api_key: str) -> None:
+        from huggingface_hub import InferenceClient
+
+        self.model_id = model_id
+        self.client = InferenceClient(model=model_id, token=api_key)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Embed a list of documents via HF Inference API."""
+        result = self.client.feature_extraction(texts)
+        # HF returns numpy arrays or nested lists
+        return [list(vec) for vec in result]
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a single query via HF Inference API."""
+        result = self.client.feature_extraction(text)
+        return list(result)
+
+
+class VoyageEmbeddings(Embeddings):
+    """LangChain-compatible wrapper for Voyage AI embedding API."""
+
+    def __init__(self, model: str = "voyage-4", api_key: str = "") -> None:
+        import voyageai
+
+        self.model = model
+        self.client = voyageai.Client(api_key=api_key)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Embed a list of documents via Voyage API."""
+        result = self.client.embed(texts, model=self.model, input_type="document")
+        return result.embeddings
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a single query via Voyage API."""
+        result = self.client.embed([text], model=self.model, input_type="query")
+        return result.embeddings[0]
+
+
+class NomicEmbeddings(Embeddings):
+    """LangChain-compatible wrapper for Nomic Atlas embedding API.
+
+    Uses the `nomic` package to call the Atlas embedding endpoint.
+    """
+
+    def __init__(self, model: str = "nomic-embed-text-v1.5", api_key: str = "") -> None:
+        import nomic
+
+        self.model = model
+        nomic.login(api_key)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Embed a list of documents via Nomic Atlas API."""
+        from nomic import embed
+
+        result = embed.text(
+            texts=texts,
+            model=self.model,
+            task_type="search_document",
+        )
+        return [list(vec) for vec in result["embeddings"]]
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a single query via Nomic Atlas API."""
+        from nomic import embed
+
+        result = embed.text(
+            texts=[text],
+            model=self.model,
+            task_type="search_query",
+        )
+        return list(result["embeddings"][0])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Provider-specific initialization functions
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _try_hf_inference_embeddings(model_id: str) -> Embeddings | None:
+    """Try to create a HuggingFace Inference API embedding model."""
+    if not settings.hf_token:
+        logger.info("Skipping HF Inference — HF_TOKEN not set")
+        return None
+
+    try:
+        model = HuggingFaceInferenceEmbeddings(
+            model_id=model_id,
+            api_key=settings.hf_token,
+        )
+        # Verify with a quick test embed
+        test_vec = model.embed_query("test")
+        logger.info(
+            "HF Inference embeddings ready: %s (%d dims)",
+            model_id,
+            len(test_vec),
+        )
+        return model
+    except Exception as exc:
+        logger.warning("HF Inference embeddings failed for %s: %s", model_id, exc)
+        return None
+
+
+def _try_hf_local_embeddings(model_id: str) -> Embeddings | None:
+    """Try to create a local HuggingFace embedding model via sentence-transformers.
+
+    Downloads the model on first use (~1.2GB for Qwen3-0.6B).
+    Cached locally after first download.
+    """
+    try:
+        from langchain_huggingface import HuggingFaceEmbeddings
+
+        model = HuggingFaceEmbeddings(
+            model_name=model_id,
+            model_kwargs={"device": "cpu", "trust_remote_code": True},
+            encode_kwargs={"normalize_embeddings": True, "batch_size": 64},
+        )
+        # Verify with a quick test embed
+        test_vec = model.embed_query("test")
+        logger.info(
+            "HF Local embeddings ready: %s (%d dims)",
+            model_id,
+            len(test_vec),
+        )
+        return model
+    except Exception as exc:
+        logger.warning("HF Local embeddings failed for %s: %s", model_id, exc)
+        return None
+
+def _try_voyage_embeddings(model_id: str) -> Embeddings | None:
+    """Try to create a Voyage AI embedding model."""
+    if not settings.voyage_api_key:
+        logger.info("Skipping Voyage embeddings — VOYAGE_API_KEY not set")
+        return None
+
+    try:
+        model = VoyageEmbeddings(model=model_id, api_key=settings.voyage_api_key)
+        # Verify with a quick test embed
+        test_vec = model.embed_query("test")
+        logger.info(
+            "Voyage embeddings ready: %s (%d dims)",
+            model_id,
+            len(test_vec),
+        )
+        return model
+    except Exception as exc:
+        logger.warning("Voyage embeddings failed for %s: %s", model_id, exc)
+        return None
+
+
+def _try_nomic_embeddings(model_id: str) -> Embeddings | None:
+    """Try to create a Nomic Atlas embedding model."""
+    if not settings.nomic_api_key:
+        logger.info("Skipping Nomic embeddings — NOMIC_API_KEY not set")
+        return None
+
+    try:
+        model = NomicEmbeddings(model=model_id, api_key=settings.nomic_api_key)
+        # Verify with a quick test embed
+        test_vec = model.embed_query("test")
+        logger.info(
+            "Nomic embeddings ready: %s (%d dims)",
+            model_id,
+            len(test_vec),
+        )
+        return model
+    except Exception as exc:
+        logger.warning("Nomic embeddings failed for %s: %s", model_id, exc)
+        return None
 
 
 def _try_openai_embeddings(model_id: str) -> Embeddings | None:
@@ -54,7 +247,7 @@ def _try_openai_embeddings(model_id: str) -> Embeddings | None:
             openai_api_key=settings.openai_api_key,
             openai_api_base=settings.openai_base_url or None,
         )
-        # Test with a quick embed to verify it works
+        # Verify with a quick test embed
         test_vec = model.embed_query("test")
         logger.info(
             "OpenAI embeddings ready: %s (%d dims)",
@@ -67,27 +260,9 @@ def _try_openai_embeddings(model_id: str) -> Embeddings | None:
         return None
 
 
-def _try_huggingface_embeddings(model_id: str) -> Embeddings | None:
-    """Try to create a HuggingFace embedding model."""
-    try:
-        from langchain_huggingface import HuggingFaceEmbeddings
-
-        model = HuggingFaceEmbeddings(
-            model_name=model_id,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True, "batch_size": 64},
-        )
-        # Test with a quick embed to verify it works
-        test_vec = model.embed_query("test")
-        logger.info(
-            "HuggingFace embeddings ready: %s (%d dims)",
-            model_id,
-            len(test_vec),
-        )
-        return model
-    except Exception as exc:
-        logger.warning("HuggingFace embeddings failed for %s: %s", model_id, exc)
-        return None
+# ═════════════════════════════════════════════════════════════════════════════
+# Public API
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 @lru_cache(maxsize=1)
@@ -108,10 +283,16 @@ def get_embedding_model() -> Embeddings:
     for name, provider, model_id, dimensions in EMBEDDING_CHAIN:
         logger.info("Trying embedding model: %s (%s)", name, provider)
 
-        if provider == "openai":
+        if provider == "hf_inference":
+            model = _try_hf_inference_embeddings(model_id)
+        elif provider == "hf_local":
+            model = _try_hf_local_embeddings(model_id)
+        elif provider == "voyage":
+            model = _try_voyage_embeddings(model_id)
+        elif provider == "nomic":
+            model = _try_nomic_embeddings(model_id)
+        elif provider == "openai":
             model = _try_openai_embeddings(model_id)
-        elif provider == "huggingface":
-            model = _try_huggingface_embeddings(model_id)
         else:
             continue
 
@@ -122,8 +303,8 @@ def get_embedding_model() -> Embeddings:
             return model
 
     raise RuntimeError(
-        "All embedding models failed. Check your API_KEY/BASE_URL in .env "
-        "or install sentence-transformers for local models."
+        "All embedding models failed. Ensure HF_TOKEN, VOYAGE_API_KEY, "
+        "NOMIC_API_KEY, or API_KEY is set in .env."
     )
 
 

@@ -39,11 +39,13 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "qdrant-client>=1.18.0",
     "ragas>=0.4.3",
+    "rank-bm25>=0.2.2",
     "redis>=7.4.0",
     "requests>=2.34.0",
     "scikit-image>=0.26.0",
     "scikit-learn>=1.8.0",
     "sentence-transformers>=5.5.1",
     "streamlit>=1.57.0",
+    "voyageai>=0.3.7",
 ]
 
