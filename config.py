@@ -40,6 +40,8 @@ class Settings(BaseModel):
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     hf_token: str = Field(default="", description="HuggingFace token for embeddings")
+    voyage_api_key: str = Field(default="", description="Voyage AI API key for embeddings")
+    nomic_api_key: str = Field(default="", description="Nomic Atlas API key for embeddings")
 
     # ── Ingestion ────────────────────────────────────────────────────────────
     jina_api_key: str = Field(default="", description="Jina Reader API key")
@@ -67,6 +69,8 @@ class Settings(BaseModel):
             openai_api_key=os.getenv("API_KEY", ""),
             openai_base_url=os.getenv("BASE_URL", ""),
             hf_token=os.getenv("HF_TOKEN", ""),
+            voyage_api_key=os.getenv("VOYAGE_API_KEY", ""),
+            nomic_api_key=os.getenv("NOMIC_API_KEY", ""),
             jina_api_key=os.getenv("JINA_API_KEY", ""),
             qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
             qdrant_api_key=os.getenv("QDRANT_API_KEY", ""),
