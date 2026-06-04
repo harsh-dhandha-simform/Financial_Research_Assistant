@@ -11,7 +11,12 @@ from pydantic import BaseModel, Field
 
 
 class RetrievedChunk(BaseModel):
-    """A single chunk returned by the hybrid retriever after RRF fusion."""
+    """A single chunk returned by the retrieval pipeline.
+
+    The score field is the primary ranking value — populated by dense search,
+    BM25, or RRF fusion depending on the retrieval stage. After RRF fusion,
+    rrf_score, dense_score, and sparse_score are all filled in.
+    """
 
     chunk_id: str = Field(..., description="ID of the matched child chunk")
     content: str = Field(..., description="Child chunk text (retrieval unit)")
@@ -23,11 +28,19 @@ class RetrievedChunk(BaseModel):
     section: str = Field(default="", description="Document section name")
 
     # ── Retrieval scores ─────────────────────────────────────────────────────
-    rrf_score: float = Field(..., description="Final Reciprocal Rank Fusion score")
+    score: float = Field(
+        default=0.0, description="Primary relevance score (used for ranking)"
+    )
+    rrf_score: float = Field(
+        default=0.0, description="Reciprocal Rank Fusion score (after fusion)"
+    )
     dense_score: float = Field(
         default=0.0, description="Dense (semantic) similarity score"
     )
     sparse_score: float = Field(default=0.0, description="BM25 sparse match score")
+    retrieval_method: str = Field(
+        default="", description="How this chunk was retrieved: 'dense', 'sparse', 'hybrid'"
+    )
 
     metadata: dict = Field(default_factory=dict)
 
