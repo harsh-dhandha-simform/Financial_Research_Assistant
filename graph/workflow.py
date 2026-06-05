@@ -1,5 +1,5 @@
 """
-LangGraph workflow — Supervisor → parallel agents → Synthesis → END.
+LangGraph workflow — Supervisor → parallel agents → Synthesis → Output Fork → END.
 
 Each agent autonomously calls its own tools (ReAct pattern):
   - Metrics Agent: rag_retriever + extract_financial_table
@@ -10,7 +10,7 @@ Each agent autonomously calls its own tools (ReAct pattern):
 No pre-fetched context — each agent decides what to retrieve.
 
 Graph topology:
-    START → supervisor → run_agents → synthesis → END
+    START → supervisor → run_agents → synthesis → output_fork → END
                           ├─ metrics_agent (tools: rag_retriever, extract_financial_table)
                           ├─ risk_agent    (tools: rag_retriever, risk_classifier)
                           └─ news_agent    (tools: tavily_search, sentiment_scorer)
@@ -29,6 +29,7 @@ from agents.risk_agent import run_risk_agent
 from agents.news_agent import run_news_agent
 from agents.synthesis_agent import run_synthesis_agent
 from graph.state import ResearchState
+from output.report_generator import generate_output_fork
 from schemas.agents import SupervisorDecision
 
 logger = logging.getLogger(__name__)
@@ -270,6 +271,34 @@ def synthesis_node(state: ResearchState) -> dict:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Node: Output Fork — generates Memo + Report (deterministic, no LLM)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def output_fork_node(state: ResearchState) -> dict:
+    """Generate InvestmentMemo and ResearchReport from SynthesisOutput.
+
+    Deterministic template-based generation — no LLM call.
+    Adds near-zero latency to the pipeline.
+    """
+    if state.synthesis_output is None:
+        logger.warning("Output fork skipped: no synthesis output")
+        return {"errors": ["Output fork skipped: synthesis output missing"]}
+
+    try:
+        memo, report = generate_output_fork(
+            synthesis=state.synthesis_output,
+            metrics=state.metrics_output,
+            risk=state.risk_output,
+            news=state.news_output,
+        )
+        return {"memo": memo, "report": report}
+    except Exception as exc:
+        logger.error("Output fork failed: %s", exc)
+        return {"errors": [f"Output fork failed: {exc}"]}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Graph construction
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -277,26 +306,28 @@ def synthesis_node(state: ResearchState) -> dict:
 def build_research_graph() -> StateGraph:
     """Build and compile the LangGraph research workflow.
 
-    Graph: supervisor → run_agents (ReAct tool loops) → synthesis → END
+    Graph: supervisor → run_agents → synthesis → output_fork → END
 
     Returns:
         A compiled StateGraph ready for .invoke().
     """
     graph = StateGraph(ResearchState)
 
-    # Add nodes — no retrieve_context_node, agents retrieve their own data
+    # Add nodes
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("run_agents", run_agents_node)
     graph.add_node("synthesis", synthesis_node)
+    graph.add_node("output_fork", output_fork_node)
 
     # Define edges
     graph.set_entry_point("supervisor")
     graph.add_edge("supervisor", "run_agents")
     graph.add_edge("run_agents", "synthesis")
-    graph.add_edge("synthesis", END)
+    graph.add_edge("synthesis", "output_fork")
+    graph.add_edge("output_fork", END)
 
     compiled = graph.compile()
-    logger.info("Research graph compiled: supervisor → agents (ReAct) → synthesis")
+    logger.info("Research graph compiled: supervisor → agents → synthesis → output_fork")
     return compiled
 
 
