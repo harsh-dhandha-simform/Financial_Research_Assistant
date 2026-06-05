@@ -2,92 +2,52 @@
 News Agent — searches recent news and analyses sentiment.
 
 Uses Gemini-3-Flash-Preview (Google AI → Gemini-2.5-Flash fallback)
-with Tavily web search for live news retrieval, then structured
-output → NewsOutput.
+with ReAct tool calling. The LLM autonomously searches for news
+and scores sentiment per article.
+
+Tools: tavily_search, sentiment_scorer
+Output: NewsOutput (structured)
 """
 
 import logging
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.tools.tavily_search import TavilySearchResults
-
-from agents.base import get_llm, create_langfuse_config
-from config import settings
+from agents.base import run_tool_agent, create_langfuse_config
+from tools.search import tavily_search
+from tools.sentiment import sentiment_scorer
 from schemas.agents import NewsOutput
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """\
-You are a financial news analyst. You will receive recent news articles
-about a company retrieved from web search.
+NEWS_TOOLS = [tavily_search, sentiment_scorer]
 
-Your job is to:
-1. Summarise each article with its headline, source, date, and sentiment.
-2. Classify sentiment as: very_positive, positive, neutral, negative, or very_negative.
-3. Rate relevance of each article to the company (0-1).
-4. Provide an overall sentiment assessment across all articles.
-5. Identify the single most impactful recent development.
+SYSTEM_PROMPT = """\
+You are a financial news analyst. You search for and analyse recent news
+about companies to assess market sentiment.
+
+You have access to the following tools:
+1. tavily_search — searches the web for recent news. Build your query as:
+   "{company_name} {ticker} news {relevant_topic}"
+   Use max_results=8 for comprehensive coverage.
+2. sentiment_scorer — scores the sentiment of a single news article.
+   Call with headline and snippet for each article. Max 5 calls to
+   avoid token bloat.
+
+WORKFLOW:
+1. Call tavily_search with a well-crafted query combining the company name,
+   ticker, and relevant financial topics.
+2. For the top 5 most relevant articles, call sentiment_scorer with the
+   headline and content snippet.
+3. You may call tavily_search again with different queries to cover
+   different angles (earnings, competition, regulatory, etc.).
 
 IMPORTANT RULES:
-1. ONLY analyse the news articles provided — do not fabricate articles.
-2. Be objective — let the facts drive sentiment, not assumptions.
-3. Consider both direct company news and broader market/sector news.
-4. Include a confidence score (0-1) reflecting how complete the news
+1. ONLY analyse actual news articles from the search results.
+2. Do NOT fabricate articles or URLs.
+3. Be objective — let the facts drive sentiment, not assumptions.
+4. Consider both direct company news and broader market/sector news.
+5. Include a confidence score (0-1) reflecting how complete the news
    coverage is for an informed assessment.
 """
-
-HUMAN_TEMPLATE = """\
-Analyse recent news for {company_name} ({ticker}).
-
-Query: {query}
-
---- Retrieved News Articles ---
-{news_context}
---- End Articles ---
-
-Provide a comprehensive news sentiment analysis.
-"""
-
-PROMPT = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_PROMPT),
-    ("human", HUMAN_TEMPLATE),
-])
-
-
-def _search_news(company_name: str, ticker: str, query: str) -> str:
-    """Search for recent news using Tavily.
-
-    Returns formatted news text for the LLM prompt.
-    """
-    search = TavilySearchResults(
-        tavily_api_key=settings.tavily_api_key,
-        max_results=8,
-        search_depth="advanced",
-        include_answer=True,
-    )
-
-    search_query = f"{company_name} {ticker} {query} latest news financial"
-    logger.info("Tavily search: '%s'", search_query)
-
-    try:
-        results = search.invoke(search_query)
-    except Exception as exc:
-        logger.warning("Tavily search failed: %s", exc)
-        return f"[News search failed: {exc}. Analyse based on available context only.]"
-
-    if not results:
-        return "[No recent news articles found for this company.]"
-
-    # Format results for the LLM
-    formatted = []
-    for i, result in enumerate(results, 1):
-        url = result.get("url", "")
-        content = result.get("content", "")
-        formatted.append(f"Article {i}:\nURL: {url}\n{content}\n")
-
-    news_text = "\n---\n".join(formatted)
-    logger.info("Tavily returned %d articles", len(results))
-    return news_text
 
 
 def run_news_agent(
@@ -96,10 +56,10 @@ def run_news_agent(
     query: str,
     session_id: str = "",
 ) -> NewsOutput:
-    """Run the News Agent to search and analyse recent news.
+    """Run the News Agent with autonomous tool calling.
 
-    Unlike Metrics/Risk agents, the News Agent does NOT receive RAG context.
-    It uses Tavily to search for live news, then analyses sentiment.
+    The agent searches for news and scores sentiment independently.
+    No RAG context needed — uses web search.
 
     Args:
         company_name: Company being analysed.
@@ -110,29 +70,27 @@ def run_news_agent(
     Returns:
         NewsOutput with articles, sentiment analysis, and key developments.
     """
-    # Step 1: Search for recent news
-    news_context = _search_news(company_name, ticker, query)
-
-    # Step 2: Analyse with LLM
-    llm = get_llm("news")
-    structured_llm = llm.with_structured_output(NewsOutput)
-
-    chain = PROMPT | structured_llm
-
     config = create_langfuse_config(
         session_id=session_id,
         trace_name="news-agent",
     )
 
+    human_prompt = (
+        f"Search for and analyse recent news about {company_name} ({ticker}).\n\n"
+        f"Query: {query}\n\n"
+        f"Use tavily_search to find recent articles, then sentiment_scorer to "
+        f"classify each article's sentiment. Provide a comprehensive news "
+        f"and sentiment analysis."
+    )
+
     logger.info("Running News Agent for %s (%s)", company_name, ticker)
 
-    result = chain.invoke(
-        {
-            "company_name": company_name,
-            "ticker": ticker,
-            "query": query,
-            "news_context": news_context,
-        },
+    result = run_tool_agent(
+        agent_name="news",
+        system_prompt=SYSTEM_PROMPT,
+        human_prompt=human_prompt,
+        tools=NEWS_TOOLS,
+        output_schema=NewsOutput,
         config=config,
     )
 

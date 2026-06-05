@@ -1,37 +1,45 @@
 """
 Synthesis Agent — merges all agent outputs into investment recommendation.
 
-Uses gpt-oss-120b (Cerebras → Qwen3-32B OpenRouter fallback) with
-structured output → SynthesisOutput.
+Uses gpt-oss-120b (Cerebras → Qwen3-32B Groq fallback) with ReAct tool
+calling. Reads prior agent outputs from state and retrieves additional
+cross-section context for a comprehensive thesis.
 
-This agent receives the outputs of Metrics, Risk, and News agents and
-produces a unified investment thesis with actionable recommendation.
+Tools: rag_retriever, get_agent_outputs
+Output: SynthesisOutput (structured)
 """
 
 import logging
 
-from langchain_core.prompts import ChatPromptTemplate
-
-from agents.base import get_llm, create_langfuse_config
+from agents.base import run_tool_agent, create_langfuse_config
+from tools.retriever import rag_retriever
+from tools.state_reader import get_agent_outputs
 from schemas.agents import MetricsOutput, RiskOutput, NewsOutput, SynthesisOutput
 
 logger = logging.getLogger(__name__)
 
+SYNTHESIS_TOOLS = [rag_retriever]  # get_agent_outputs data is injected directly
+
 SYSTEM_PROMPT = """\
 You are a senior investment analyst at a top-tier research firm. You are
 producing a comprehensive investment thesis by synthesising inputs from
-three specialist analysts:
+three specialist analysts.
 
-1. **Metrics Analyst** — extracted financial metrics from SEC filings
-2. **Risk Analyst** — identified and categorised risks
-3. **News Analyst** — analysed recent news and market sentiment
+You have access to the following tools:
+1. rag_retriever — retrieves additional document sections for context.
+   Use with no section_filter for broad cross-section retrieval
+   (MD&A, business overview, notes, guidance).
+   Use top_k=10 for comprehensive coverage.
 
-Your job is to:
-1. Synthesise all three analyses into a coherent investment thesis (3-5 paragraphs).
-2. Assign an investment rating: strong_buy, buy, hold, sell, or strong_sell.
-3. Provide clear rationale for your rating.
-4. List key strengths (bull case) and weaknesses (bear case).
-5. Identify upcoming catalysts that could move the stock.
+You will receive the outputs of three specialist agents in the query.
+Use rag_retriever to gather additional context if needed (executive quotes,
+guidance, business overview, etc.).
+
+WORKFLOW:
+1. Review the specialist agent outputs provided in the query.
+2. Optionally call rag_retriever for additional context (business overview,
+   management guidance, competitive positioning).
+3. Synthesise all inputs into a coherent investment thesis.
 
 IMPORTANT RULES:
 1. Your thesis must be grounded in the data provided — no speculation beyond
@@ -42,30 +50,9 @@ IMPORTANT RULES:
 5. Your conclusion must be actionable — an investor should know what to do.
 """
 
-HUMAN_TEMPLATE = """\
-Synthesise the following specialist analyses for {company_name} ({ticker}).
-Produce an investment thesis with a clear recommendation.
-
-=== FINANCIAL METRICS ===
-{metrics_summary}
-
-=== RISK ASSESSMENT ===
-{risk_summary}
-
-=== NEWS & SENTIMENT ===
-{news_summary}
-
-Provide your investment thesis, rating, and actionable recommendation.
-"""
-
-PROMPT = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_PROMPT),
-    ("human", HUMAN_TEMPLATE),
-])
-
 
 def _format_metrics(output: MetricsOutput | None) -> str:
-    """Format MetricsOutput into a readable summary for the synthesis prompt."""
+    """Format MetricsOutput into a readable summary."""
     if output is None:
         return "[Metrics analysis not available — agent did not run or failed.]"
 
@@ -97,12 +84,11 @@ def _format_metrics(output: MetricsOutput | None) -> str:
 
     parts.append(f"\nSummary: {output.summary}")
     parts.append(f"Confidence: {output.confidence:.0%}")
-
     return "\n".join(parts)
 
 
 def _format_risks(output: RiskOutput | None) -> str:
-    """Format RiskOutput into a readable summary for the synthesis prompt."""
+    """Format RiskOutput into a readable summary."""
     if output is None:
         return "[Risk analysis not available — agent did not run or failed.]"
 
@@ -125,12 +111,11 @@ def _format_risks(output: RiskOutput | None) -> str:
 
     parts.append(f"\nRisk Summary: {output.risk_summary}")
     parts.append(f"Confidence: {output.confidence:.0%}")
-
     return "\n".join(parts)
 
 
 def _format_news(output: NewsOutput | None) -> str:
-    """Format NewsOutput into a readable summary for the synthesis prompt."""
+    """Format NewsOutput into a readable summary."""
     if output is None:
         return "[News analysis not available — agent did not run or failed.]"
 
@@ -143,15 +128,12 @@ def _format_news(output: NewsOutput | None) -> str:
     ]
 
     for a in output.articles:
-        parts.append(
-            f"  [{a.sentiment.value:14s}] {a.headline}"
-        )
+        parts.append(f"  [{a.sentiment.value:14s}] {a.headline}")
         if a.summary:
             parts.append(f"    {a.summary[:150]}...")
 
     parts.append(f"\nSentiment Summary: {output.sentiment_summary}")
     parts.append(f"Confidence: {output.confidence:.0%}")
-
     return "\n".join(parts)
 
 
@@ -163,10 +145,10 @@ def run_synthesis_agent(
     news_output: NewsOutput | None,
     session_id: str = "",
 ) -> SynthesisOutput:
-    """Run the Synthesis Agent to produce an investment thesis.
+    """Run the Synthesis Agent with autonomous tool calling.
 
-    Merges outputs from all specialist agents into a unified
-    recommendation with clear rationale.
+    Receives prior agent outputs and may retrieve additional context
+    via rag_retriever for a comprehensive thesis.
 
     Args:
         company_name: Company being analysed.
@@ -179,26 +161,31 @@ def run_synthesis_agent(
     Returns:
         SynthesisOutput with investment thesis and rating.
     """
-    llm = get_llm("synthesis")
-    structured_llm = llm.with_structured_output(SynthesisOutput)
-
-    chain = PROMPT | structured_llm
-
     config = create_langfuse_config(
         session_id=session_id,
         trace_name="synthesis-agent",
     )
 
+    # Format agent outputs into the human prompt
+    human_prompt = (
+        f"Synthesise the following specialist analyses for "
+        f"{company_name} ({ticker}).\n"
+        f"Produce an investment thesis with a clear recommendation.\n\n"
+        f"=== FINANCIAL METRICS ===\n{_format_metrics(metrics_output)}\n\n"
+        f"=== RISK ASSESSMENT ===\n{_format_risks(risk_output)}\n\n"
+        f"=== NEWS & SENTIMENT ===\n{_format_news(news_output)}\n\n"
+        f"Use rag_retriever if you need additional context (business overview, "
+        f"management guidance, etc.) to strengthen your thesis."
+    )
+
     logger.info("Running Synthesis Agent for %s (%s)", company_name, ticker)
 
-    result = chain.invoke(
-        {
-            "company_name": company_name,
-            "ticker": ticker,
-            "metrics_summary": _format_metrics(metrics_output),
-            "risk_summary": _format_risks(risk_output),
-            "news_summary": _format_news(news_output),
-        },
+    result = run_tool_agent(
+        agent_name="synthesis",
+        system_prompt=SYSTEM_PROMPT,
+        human_prompt=human_prompt,
+        tools=SYNTHESIS_TOOLS,
+        output_schema=SynthesisOutput,
         config=config,
     )
 
