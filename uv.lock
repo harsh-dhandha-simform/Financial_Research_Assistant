@@ -1075,6 +1075,7 @@ dependencies = [
     { name = "langchain-google-genai" },
     { name = "langchain-huggingface" },
     { name = "langchain-nomic" },
+    { name = "langchain-nvidia-ai-endpoints" },
     { name = "langchain-openai" },
     { name = "langchain-openrouter" },
     { name = "langfuse" },
@@ -1122,6 +1123,7 @@ requires-dist = [
     { name = "langchain-google-genai", specifier = ">=3.2.0" },
     { name = "langchain-huggingface", specifier = ">=1.2.2" },
     { name = "langchain-nomic", specifier = ">=1.0.1" },
+    { name = "langchain-nvidia-ai-endpoints", specifier = ">=1.4.1" },
     { name = "langchain-openai", specifier = ">=1.2.1" },
     { name = "langchain-openrouter", specifier = ">=0.2.3" },
     { name = "langfuse", specifier = ">=4.6.1" },
@@ -2128,6 +2130,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/24/c3/19b2b77b95da73f36e7331a0570def8ec8346821e54e5b9e0cbb5ad7a1b9/langchain_nomic-1.0.1.tar.gz", hash = "sha256:f7ced9b13fd8ef6d6b636424dc380e84652c33f23ce30071569f701cea39ccae", size = 154061, upload-time = "2025-11-13T16:27:38.451Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/41/a2/d0499ad3ecda6ef195c0904cdea1bd5ba530223e90f08d3fdd2f5f60998d/langchain_nomic-1.0.1-py3-none-any.whl", hash = "sha256:65befe8662018b009c7589898a79d434851ba8af2371171e1260b677e4974b72", size = 4142, upload-time = "2025-11-13T16:27:37.582Z" },
+]
+
+[[package]]
+name = "langchain-nvidia-ai-endpoints"
+version = "1.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "filetype" },
+    { name = "langchain-core" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f9/26/cae8babfecb9b7b503dbf5d6c0d98df74149c3151247d20e7bbfd17ca461/langchain_nvidia_ai_endpoints-1.4.1.tar.gz", hash = "sha256:8835f7e56d559b370b87164f937c1eb048ab837f25de91598f00555a705c2d16", size = 58092, upload-time = "2026-06-03T19:34:15.117Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/30/50/9dcb23c73270e775c38e8d264ccbf8b1b352dbac089bce3746756d895e46/langchain_nvidia_ai_endpoints-1.4.1-py3-none-any.whl", hash = "sha256:3edd1678a3e2c55789128e53ba32aab3dffe94cb201c70e6cea521fab7c261ff", size = 63203, upload-time = "2026-06-03T19:34:11.08Z" },
 ]
 
 [[package]]

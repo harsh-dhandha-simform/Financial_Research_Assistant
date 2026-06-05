@@ -14,8 +14,8 @@ Routing table:
     │ Agent        │ Primary                                     │ Fallback                                 │
     ├──────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────┤
     │ Metrics      │ Llama-3.1-8B (HF Inference / Scaleway)      │ Llama-3.1-8B (Groq)                      │
-    │ Risk         │ Qwen-2.5-72B (HF Inference / Novita)        │ Llama-3.3-70B-Instruct:free (OpenRouter)  │
-    │ News         │ gemini-3-flash-preview (Google AI)           │ gemini-2.5-flash (Google AI)              │
+    │ Risk         │ Qwen-2.5-72B (HF Inference / Novita)        │ Nemotron-3-Super-120B (NVIDIA)            │
+    │ News         │ gemini-2.5-flash (Google AI)                 │ gemini-3.5-flash (Google AI)        │
     │ Supervisor   │ gpt-oss-120b (OpenRouter)                   │ Qwen-2.5-72B (HF Inference)              │
     │ Synthesis    │ gpt-oss-120b (Cerebras)                     │ Qwen3-32B (Groq)                         │
     └──────────────┴─────────────────────────────────────────────┴──────────────────────────────────────────┘
@@ -25,11 +25,18 @@ Fallback triggers:
     • Request timeout (> 30 seconds) → switch to faster fallback model
     • Malformed JSON / Pydantic validation failure → retry on fallback
     • Full provider outage (connection error) → entire chain falls to next
+
+Structured output methods:
+    • "json_schema"  — strict JSON schema enforcement (OpenRouter, Cerebras)
+    • "json_mode"    — basic json_object mode (HF Inference, Groq, NVIDIA)
+    • "function_calling" — uses tool/function call (Google/Gemini)
+    Models that don't support json_schema use json_mode with explicit
+    JSON instructions injected into the prompt.
 """
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from langchain_core.messages import (
@@ -56,11 +63,12 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
 CEREBRAS_URL = "https://api.cerebras.ai/v1"
 GOOGLE_GENAI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+NVIDIA_URL = "https://integrate.api.nvidia.com/v1"
 
 # ── Timeouts & limits ────────────────────────────────────────────────────────
-# Per-call timeout. If a single LLM call exceeds this, the entire model
-# is considered failed and we fall through to the next in the chain.
-REQUEST_TIMEOUT = 10    # seconds — triggers fallback if exceeded
+# Per-call timeout. Structured output with large models (gpt-oss-120b,
+# Qwen 72B) can take 15-25s. 30s gives headroom before triggering fallback.
+REQUEST_TIMEOUT = 30    # seconds — triggers fallback if exceeded
 MAX_TOOL_ITERATIONS = 5  # max ReAct loop iterations before forcing output
 
 
@@ -69,36 +77,77 @@ MAX_TOOL_ITERATIONS = 5  # max ReAct loop iterations before forcing output
 
 @dataclass
 class ModelConfig:
-    """Configuration for a single LLM model."""
+    """Configuration for a single LLM model.
+
+    structured_method controls how .with_structured_output() works:
+      - "json_schema"      → strict schema enforcement (default)
+      - "json_mode"        → response_format: {"type": "json_object"}
+      - "function_calling" → uses tool/function calling to enforce schema
+    """
 
     model_id: str
-    provider: str        # "hf_inference", "openrouter", "groq", "cerebras", "google"
+    provider: str        # "hf_inference", "openrouter", "groq", "cerebras", "google", "nvidia"
     max_tokens: int = 4096
     temperature: float = 0.0
     timeout: int = REQUEST_TIMEOUT
+    structured_method: str = "json_schema"
 
 
 # Agent → (primary, fallback) model chains
+#
+# Structured method notes:
+#   - HF Inference (Novita/Scaleway): json_schema technically supported but
+#     causes "add_generation_prompt" issues → use json_mode
+#   - Groq: llama-3.1-8b-instant doesn't support json_schema → use json_mode
+#   - NVIDIA: OpenAI-compat but json_mode is most reliable
+#   - OpenRouter: supports json_schema via function_calling
+#   - Cerebras: supports json_schema
+#   - Google: use function_calling (most reliable for Gemini)
 AGENT_MODELS: dict[str, list[ModelConfig]] = {
     "metrics": [
-        ModelConfig("meta-llama/Llama-3.1-8B-Instruct:scaleway", "hf_inference"),
-        ModelConfig("llama-3.1-8b-instant", "groq"),
+        ModelConfig(
+            "meta-llama/Llama-3.1-8B-Instruct:scaleway", "hf_inference",
+            structured_method="json_mode",
+        ),
+        ModelConfig(
+            "llama-3.1-8b-instant", "groq",
+            structured_method="json_mode",
+        ),
     ],
     "risk": [
-        ModelConfig("Qwen/Qwen2.5-72B-Instruct:novita", "hf_inference"),
-        ModelConfig("meta-llama/llama-3.3-70b-instruct:free", "openrouter"),
+        ModelConfig(
+            "Qwen/Qwen2.5-72B-Instruct:featherless-ai", "hf_inference",
+            structured_method="json_mode",
+        ),
+        ModelConfig(
+            "nvidia/nemotron-3-super-120b-a12b", "nvidia",
+            structured_method="json_mode",
+        ),
     ],
     "news": [
-        ModelConfig("gemini-3-flash-preview", "google"),
-        ModelConfig("gemini-2.5-flash", "google"),
+        # gemini-2.5-flash is primary — gemini-3.5-flash
+        ModelConfig(
+            "gemini-2.5-flash", "google",
+            structured_method="function_calling",
+        ),
+        ModelConfig(
+            "gemini-3.5-flash", "google",
+            structured_method="function_calling",
+        ),
     ],
     "supervisor": [
         ModelConfig("openai/gpt-oss-120b", "openrouter"),
-        ModelConfig("Qwen/Qwen2.5-72B-Instruct:novita", "hf_inference"),
+        ModelConfig(
+            "Qwen/Qwen2.5-72B-Instruct:featherless-ai", "hf_inference",
+            structured_method="json_mode",
+        ),
     ],
     "synthesis": [
         ModelConfig("gpt-oss-120b", "cerebras"),
-        ModelConfig("qwen/qwen3-32b", "groq"),
+        ModelConfig(
+            "qwen/qwen3-32b", "groq",
+            structured_method="json_mode",
+        ),
     ],
 }
 
@@ -111,6 +160,7 @@ def _get_api_key(provider: str) -> str:
         "groq": settings.groq_api_key,
         "cerebras": settings.cerebras_api_key,
         "google": settings.google_api_key,
+        "nvidia": settings.nvidia_api_key,
     }
     return key_map.get(provider, "")
 
@@ -123,6 +173,7 @@ def _get_base_url(provider: str) -> str:
         "groq": GROQ_URL,
         "cerebras": CEREBRAS_URL,
         "google": GOOGLE_GENAI_URL,
+        "nvidia": NVIDIA_URL,
     }
     return url_map.get(provider, "")
 
@@ -171,6 +222,30 @@ def _create_llm(config: ModelConfig) -> ChatOpenAI:
         max_tokens=config.max_tokens,
         request_timeout=config.timeout,
     )
+
+
+def _get_structured_llm(
+    llm: ChatOpenAI,
+    output_schema: type[T],
+    method: str,
+) -> Any:
+    """Create a structured output LLM using the correct method for the provider.
+
+    Args:
+        llm: The base ChatOpenAI instance.
+        output_schema: The Pydantic model to enforce.
+        method: One of "json_schema", "json_mode", "function_calling".
+
+    Returns:
+        An LLM wrapped with .with_structured_output().
+    """
+    if method == "json_mode":
+        return llm.with_structured_output(output_schema, method="json_mode")
+    elif method == "function_calling":
+        return llm.with_structured_output(output_schema, method="function_calling")
+    else:
+        # Default: json_schema (strict)
+        return llm.with_structured_output(output_schema)
 
 
 def get_llm(agent_name: str) -> ChatOpenAI:
@@ -259,6 +334,64 @@ def _execute_tool_calls(
 # ═════════════════════════════════════════════════════════════════════════════
 # ReAct tool-calling agent loop
 # ═════════════════════════════════════════════════════════════════════════════
+
+
+def _prepare_messages_for_structured_output(
+    messages: list,
+    method: str,
+    output_schema: type[BaseModel],
+) -> list:
+    """Prepare message list for the structured output call.
+
+    Fixes two provider-specific issues:
+    1. HF Inference "add_generation_prompt" error — when the last message
+       is from the assistant, HF rejects the request. We inject a
+       HumanMessage to fix the turn ordering.
+    2. json_mode providers need explicit JSON instruction so the model
+       knows to output JSON (required by Qwen, Groq, etc.).
+
+    Args:
+        messages: The accumulated conversation messages.
+        method: The structured output method being used.
+        output_schema: The Pydantic schema (used to build JSON instruction).
+
+    Returns:
+        A copy of messages with any necessary fixups applied.
+    """
+    msgs = list(messages)  # shallow copy
+
+    # Fix: If the last message is an AIMessage, some providers
+    # (HF/Scaleway) fail with "Cannot set add_generation_prompt to True".
+    # Always add a HumanMessage to ensure proper turn ordering.
+    needs_human_suffix = (
+        msgs and isinstance(msgs[-1], AIMessage)
+    )
+
+    if method == "json_mode":
+        # json_mode providers need explicit JSON instruction.
+        # Qwen specifically requires the word "json" in the messages.
+        schema_hint = output_schema.model_json_schema()
+        extraction_msg = HumanMessage(
+            content=(
+                "Based on all the information gathered above, produce your "
+                "final analysis as valid JSON matching this schema:\n\n"
+                f"```json\n{schema_hint}\n```\n\n"
+                "Respond ONLY with the JSON object, no markdown or explanation."
+            )
+        )
+        msgs.append(extraction_msg)
+    elif needs_human_suffix:
+        # For json_schema/function_calling: just fix the turn ordering
+        msgs.append(
+            HumanMessage(
+                content=(
+                    "Now produce your final structured analysis based on "
+                    "everything above."
+                )
+            )
+        )
+
+    return msgs
 
 
 def run_tool_agent(
@@ -352,10 +485,15 @@ def run_tool_agent(
                 )
 
             # ── Structured output from accumulated messages ─────────
-            # The messages already contain all tool results. One call
-            # with .with_structured_output() extracts the typed answer.
-            structured_llm = llm.with_structured_output(output_schema)
-            result = structured_llm.invoke(messages, config=config)
+            # Prepare messages: fix turn ordering & inject JSON hints
+            # for providers that need them.
+            output_messages = _prepare_messages_for_structured_output(
+                messages, model_config.structured_method, output_schema,
+            )
+            structured_llm = _get_structured_llm(
+                llm, output_schema, model_config.structured_method,
+            )
+            result = structured_llm.invoke(output_messages, config=config)
             elapsed = time.monotonic() - start
 
             logger.info(
@@ -425,7 +563,9 @@ def invoke_with_fallback(
                 continue
 
             llm = _create_llm(model_config)
-            structured_llm = llm.with_structured_output(output_schema)
+            structured_llm = _get_structured_llm(
+                llm, output_schema, model_config.structured_method,
+            )
             chain = prompt_chain | structured_llm
 
             start = time.monotonic()
