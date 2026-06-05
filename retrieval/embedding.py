@@ -42,8 +42,8 @@ EMBEDDING_CHAIN: list[tuple[str, str, str, int]] = [
     ("Qwen3-Embedding-0.6B", "hf_local", "Qwen/Qwen3-Embedding-0.6B", 1024),
     # ── Fallback: different dimensions ──
     ("nomic-embed-text-v1.5", "nomic", "nomic-embed-text-v1.5", 768),
-    ("OpenAI text-embedding-3-large", "openai", "text-embedding-3-large", 3072),
-    ("OpenAI text-embedding-3-small", "openai", "text-embedding-3-small", 1536),
+    ("OpenAI text-embedding-3-large", "openai", "text-embedding-3-large", 1024),
+    ("OpenAI text-embedding-3-small", "openai", "text-embedding-3-small", 1024),
 ]
 
 # Cached model info after successful initialization
