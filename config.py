@@ -28,13 +28,16 @@ class Settings(BaseModel):
         description="Langfuse host URL",
     )
 
-    # ── LLM Providers ───────────────────────────────────────────────────────
+    # ── LLM Providers ─────────────────────────────────────────────────────
     openrouter_api_key: str = Field(
-        default="", description="OpenRouter API key (Metrics, Risk, News agents)"
+        default="", description="OpenRouter API key"
     )
     google_api_key: str = Field(default="", description="Google AI API key")
+    groq_api_key: str = Field(default="", description="Groq API key (Llama fallback)")
+    cerebras_api_key: str = Field(default="", description="Cerebras API key (gpt-oss-120b)")
+    nvidia_api_key: str = Field(default="", description="NVIDIA API key (Nemotron fallback)")
 
-    # ── OpenAI-compatible fallback ───────────────────────────────────────────
+    # ── OpenAI-compatible fallback ───────────────────────────────────────
     openai_api_key: str = Field(default="", description="OpenAI-compat API key")
     openai_base_url: str = Field(default="", description="OpenAI-compat base URL")
 
@@ -66,6 +69,9 @@ class Settings(BaseModel):
             ),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
             google_api_key=os.getenv("GOOGLE_API_KEY", ""),
+            groq_api_key=os.getenv("GROQ_API_KEY", ""),
+            cerebras_api_key=os.getenv("CEREBRAS_API_KEY", ""),
+            nvidia_api_key=os.getenv("NVIDIA_API_KEY", ""),
             openai_api_key=os.getenv("API_KEY", ""),
             openai_base_url=os.getenv("BASE_URL", ""),
             hf_token=os.getenv("HF_TOKEN", ""),

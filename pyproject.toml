@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "asyncio>=4.0.0",
+    "cerebras-cloud-sdk>=1.67.0",
     "chonkie[cerebras,openai,semantic,viz]>=1.6.6",
     "chromadb>=1.5.9",
     "ddgs>=9.14.2",
@@ -22,6 +23,7 @@ dependencies = [
     "langchain-google-genai>=3.2.0",
     "langchain-huggingface>=1.2.2",
     "langchain-nomic>=1.0.1",
+    "langchain-nvidia-ai-endpoints>=1.4.1",
     "langchain-openai>=1.2.1",
     "langchain-openrouter>=0.2.3",
     "langfuse>=4.6.1",
