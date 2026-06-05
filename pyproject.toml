@@ -30,6 +30,7 @@ dependencies = [
     "langfuse-langchain>=2.60.10.1",
     "langgraph>=1.2.0",
     "langgraph-checkpoint-sqlite>=3.1.0",
+    "markdown>=3.10.2",
     "matplotlib>=3.10.9",
     "nomic>=3.9.0",
     "numpy>=2.4.4",
@@ -38,6 +39,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "pymupdf>=1.27.2.3",
     "pypdf>=6.11.0",
+    "python-docx>=1.2.0",
     "python-dotenv>=1.2.2",
     "qdrant-client>=1.18.0",
     "ragas>=0.4.3",
@@ -49,5 +51,6 @@ dependencies = [
     "sentence-transformers>=5.5.1",
     "streamlit>=1.57.0",
     "voyageai>=0.3.7",
+    "weasyprint>=69.0",
 ]
 
