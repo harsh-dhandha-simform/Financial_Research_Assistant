@@ -1,15 +1,17 @@
 """
 Metrics Agent — extracts financial metrics from SEC filings.
 
-Uses llama-3.1-8b via OpenRouter with structured output → MetricsOutput.
+Uses Llama-3.1-8B (HF Inference → Groq fallback) with structured output → MetricsOutput.
 Receives RAG context from the hybrid retriever (dense + BM25 + RRF).
+
+Tools: rag_retriever, extract_financial_table
 """
 
 import logging
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from agents.base import get_openrouter_llm, create_langfuse_config
+from agents.base import invoke_with_fallback, create_langfuse_config
 from schemas.agents import MetricsOutput
 
 logger = logging.getLogger(__name__)
@@ -47,7 +49,6 @@ Query: {query}
 Extract all financial metrics with precision. Be thorough.
 """
 
-# Build the prompt template
 PROMPT = ChatPromptTemplate.from_messages([
     ("system", SYSTEM_PROMPT),
     ("human", HUMAN_TEMPLATE),
@@ -63,6 +64,9 @@ def run_metrics_agent(
 ) -> MetricsOutput:
     """Run the Metrics Agent to extract financial metrics.
 
+    Uses invoke_with_fallback for automatic failover on rate limits,
+    timeouts, and JSON errors.
+
     Args:
         company_name: Company being analysed.
         ticker: Stock ticker.
@@ -73,11 +77,6 @@ def run_metrics_agent(
     Returns:
         MetricsOutput with extracted financial metrics.
     """
-    llm = get_openrouter_llm("metrics")
-    structured_llm = llm.with_structured_output(MetricsOutput)
-
-    chain = PROMPT | structured_llm
-
     config = create_langfuse_config(
         session_id=session_id,
         trace_name="metrics-agent",
@@ -85,13 +84,16 @@ def run_metrics_agent(
 
     logger.info("Running Metrics Agent for %s (%s)", company_name, ticker)
 
-    result = chain.invoke(
-        {
+    result = invoke_with_fallback(
+        agent_name="metrics",
+        prompt_chain=PROMPT,
+        input_data={
             "company_name": company_name,
             "ticker": ticker,
             "query": query,
             "context": context,
         },
+        output_schema=MetricsOutput,
         config=config,
     )
 
