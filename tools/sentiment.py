@@ -13,7 +13,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from agents.base import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -62,16 +61,27 @@ def sentiment_scorer(headline: str, snippet: str) -> dict:
     Returns:
         Dict with sentiment, score (-1 to +1), and reasoning.
     """
-    llm = get_llm("news")
-    structured_llm = llm.with_structured_output(SentimentResult)
-    chain = SENTIMENT_PROMPT | structured_llm
+    try:
+        from agents.base import get_llm
+        llm = get_llm("news")
+        structured_llm = llm.with_structured_output(
+            SentimentResult, method="json_mode"
+        )
+        chain = SENTIMENT_PROMPT | structured_llm
 
-    result = chain.invoke({"headline": headline, "snippet": snippet})
+        result = chain.invoke({"headline": headline, "snippet": snippet})
 
-    logger.info(
-        "sentiment_scorer: %s (%.2f) — %s",
-        result.sentiment,
-        result.score,
-        headline[:60],
-    )
-    return result.model_dump()
+        logger.info(
+            "sentiment_scorer: %s (%.2f) — %s",
+            result.sentiment,
+            result.score,
+            headline[:60],
+        )
+        return result.model_dump()
+    except Exception as exc:
+        logger.warning("sentiment_scorer failed: %s — returning neutral", exc)
+        return {
+            "sentiment": "neutral",
+            "score": 0.0,
+            "reasoning": f"Classification failed: {str(exc)[:100]}",
+        }

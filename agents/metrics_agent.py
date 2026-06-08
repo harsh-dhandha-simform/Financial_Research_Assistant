@@ -27,7 +27,7 @@ from SEC filings (10-K, 10-Q, 8-K, DEF 14A).
 You have access to the following tools:
 1. rag_retriever — retrieves relevant document sections from the filing.
    Use section_filter="mda" for financial metrics, or "" for broad search.
-   Use top_k=8 for thorough coverage.
+   Use top_k=6 for thorough coverage.
 2. extract_financial_table — extracts structured metrics from text containing
    $ or % values. Call this on retrieved chunks that contain tabular data.
 

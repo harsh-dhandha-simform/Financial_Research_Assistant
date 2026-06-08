@@ -32,7 +32,11 @@ class Settings(BaseModel):
     openrouter_api_key: str = Field(
         default="", description="OpenRouter API key"
     )
-    google_api_key: str = Field(default="", description="Google AI API key")
+    google_api_key: str = Field(default="", description="Google AI API key (primary)")
+    google_api_keys: list[str] = Field(
+        default_factory=list,
+        description="All Google API keys for rotation on rate limits",
+    )
     groq_api_key: str = Field(default="", description="Groq API key (Llama fallback)")
     cerebras_api_key: str = Field(default="", description="Cerebras API key (gpt-oss-120b)")
     nvidia_api_key: str = Field(default="", description="NVIDIA API key (Nemotron fallback)")
@@ -61,6 +65,21 @@ class Settings(BaseModel):
     @classmethod
     def from_env(cls) -> "Settings":
         """Construct Settings by reading current environment variables."""
+        # Collect all GOOGLE_API_KEY variants
+        google_keys = []
+        primary_google = os.getenv("GOOGLE_API_KEY", "")
+        if primary_google:
+            google_keys.append(primary_google)
+        # Scan for GOOGLE_API_KEY_2, _3, ..., _10
+        for i in range(2, 11):
+            key = os.getenv(f"GOOGLE_API_KEY_{i}", "")
+            if key:
+                google_keys.append(key)
+        # Also check the typo variant
+        typo_key = os.getenv("GOOGLW_API_KEY_3", "")
+        if typo_key and typo_key not in google_keys:
+            google_keys.append(typo_key)
+
         return cls(
             langfuse_secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),
             langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
@@ -68,7 +87,8 @@ class Settings(BaseModel):
                 "LANGFUSE_BASE_URL", "https://us.cloud.langfuse.com"
             ),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
-            google_api_key=os.getenv("GOOGLE_API_KEY", ""),
+            google_api_key=primary_google,
+            google_api_keys=google_keys,
             groq_api_key=os.getenv("GROQ_API_KEY", ""),
             cerebras_api_key=os.getenv("CEREBRAS_API_KEY", ""),
             nvidia_api_key=os.getenv("NVIDIA_API_KEY", ""),

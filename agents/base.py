@@ -70,6 +70,12 @@ NVIDIA_URL = "https://integrate.api.nvidia.com/v1"
 # Qwen 72B) can take 15-25s. 30s gives headroom before triggering fallback.
 REQUEST_TIMEOUT = 30    # seconds — triggers fallback if exceeded
 MAX_TOOL_ITERATIONS = 5  # max ReAct loop iterations before forcing output
+MAX_TOOL_OUTPUT_CHARS = 3000  # truncate tool outputs to prevent TPM blowout
+
+
+# ── Google API key rotation ───────────────────────────────────────────────
+# Tracks the current Google key index so on 429 we rotate to the next one.
+_google_key_index = 0
 
 
 # ── Model definitions ────────────────────────────────────────────────────────
@@ -125,14 +131,14 @@ AGENT_MODELS: dict[str, list[ModelConfig]] = {
         ),
     ],
     "news": [
-        # gemini-2.5-flash is primary — gemini-3.5-flash
+        # gemini-2.5-flash primary — Groq Llama fallback (Gemini 3.5 has thought_signature bugs)
         ModelConfig(
             "gemini-2.5-flash", "google",
             structured_method="function_calling",
         ),
         ModelConfig(
-            "gemini-3.5-flash", "google",
-            structured_method="function_calling",
+            "llama-3.3-70b-versatile", "groq",
+            structured_method="json_mode",
         ),
     ],
     "supervisor": [
@@ -145,24 +151,50 @@ AGENT_MODELS: dict[str, list[ModelConfig]] = {
     "synthesis": [
         ModelConfig("gpt-oss-120b", "cerebras"),
         ModelConfig(
-            "qwen/qwen3-32b", "groq",
+            "Qwen/Qwen2.5-72B-Instruct:featherless-ai", "hf_inference",
             structured_method="json_mode",
+            timeout=120,
         ),
     ],
 }
 
 
 def _get_api_key(provider: str) -> str:
-    """Get the API key for a given provider."""
+    """Get the API key for a given provider.
+
+    For Google, uses the rotation index to pick from all available keys.
+    """
+    global _google_key_index
+    if provider == "google":
+        keys = settings.google_api_keys
+        if not keys:
+            return ""
+        idx = _google_key_index % len(keys)
+        return keys[idx]
+
     key_map = {
         "hf_inference": settings.hf_token,
         "openrouter": settings.openrouter_api_key,
         "groq": settings.groq_api_key,
         "cerebras": settings.cerebras_api_key,
-        "google": settings.google_api_key,
         "nvidia": settings.nvidia_api_key,
     }
     return key_map.get(provider, "")
+
+
+def _rotate_google_key():
+    """Rotate to the next Google API key after a 429 rate limit."""
+    global _google_key_index
+    keys = settings.google_api_keys
+    if len(keys) <= 1:
+        return  # Nothing to rotate
+    old_idx = _google_key_index % len(keys)
+    _google_key_index += 1
+    new_idx = _google_key_index % len(keys)
+    logger.info(
+        "Google API key rotated: key %d → key %d (of %d total)",
+        old_idx + 1, new_idx + 1, len(keys),
+    )
 
 
 def _get_base_url(provider: str) -> str:
@@ -314,18 +346,22 @@ def _execute_tool_calls(
         else:
             try:
                 result = tool.invoke(tool_args)
+                result_str = str(result)
+                # Truncate to prevent TPM blowout on free-tier providers
+                if len(result_str) > MAX_TOOL_OUTPUT_CHARS:
+                    result_str = result_str[:MAX_TOOL_OUTPUT_CHARS] + "\n... [truncated]"
                 logger.info(
                     "Tool '%s' executed: args=%s → %s chars",
                     tool_name,
                     {k: str(v)[:50] for k, v in tool_args.items()},
-                    len(str(result)),
+                    len(result_str),
                 )
             except Exception as exc:
-                result = f"Tool error: {exc}"
+                result_str = f"Tool error: {exc}"
                 logger.warning("Tool '%s' failed: %s", tool_name, exc)
 
         tool_messages.append(
-            ToolMessage(content=str(result), tool_call_id=tool_id)
+            ToolMessage(content=result_str, tool_call_id=tool_id)
         )
 
     return tool_messages
@@ -360,11 +396,12 @@ def _prepare_messages_for_structured_output(
     """
     msgs = list(messages)  # shallow copy
 
-    # Fix: If the last message is an AIMessage, some providers
-    # (HF/Scaleway) fail with "Cannot set add_generation_prompt to True".
+    # Fix: If the last message is an AIMessage or ToolMessage, some providers
+    # (HF/Scaleway) fail with role ordering errors like
+    # "Unexpected role 'user' after role 'tool'".
     # Always add a HumanMessage to ensure proper turn ordering.
     needs_human_suffix = (
-        msgs and isinstance(msgs[-1], AIMessage)
+        msgs and isinstance(msgs[-1], (AIMessage, ToolMessage))
     )
 
     if method == "json_mode":
@@ -436,81 +473,92 @@ def run_tool_agent(
         is_fallback = i > 0
         label = "fallback" if is_fallback else "primary"
 
-        try:
-            api_key = _get_api_key(model_config.provider)
-            if not api_key:
-                logger.warning(
-                    "[%s] %s: No API key for %s — skipping",
-                    agent_name, label, model_config.provider,
-                )
-                continue
+        max_attempts = len(settings.google_api_keys) if model_config.provider == "google" else 1
 
-            llm = _create_llm(model_config)
-
-            logger.info(
-                "[%s] %s: Starting ReAct loop with %s via %s (tools: %s)",
-                agent_name, label, model_config.model_id, model_config.provider,
-                [t.name for t in tools],
-            )
-
-            # ── ReAct tool-calling loop ─────────────────────────
-            llm_with_tools = llm.bind_tools(tools)
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=human_prompt),
-            ]
-
-            start = time.monotonic()
-            tool_call_count = 0
-
-            for iteration in range(MAX_TOOL_ITERATIONS):
-                response = llm_with_tools.invoke(messages, config=config)
-                messages.append(response)
-
-                if not response.tool_calls:
-                    logger.info(
-                        "[%s] %s: LLM done after %d tool calls (%d iterations)",
-                        agent_name, label, tool_call_count, iteration + 1,
+        for attempt in range(max_attempts):
+            try:
+                api_key = _get_api_key(model_config.provider)
+                if not api_key:
+                    logger.warning(
+                        "[%s] %s: No API key for %s — skipping",
+                        agent_name, label, model_config.provider,
                     )
                     break
 
-                # Execute tool calls and feed results back
-                tool_messages = _execute_tool_calls(response, tools)
-                messages.extend(tool_messages)
-                tool_call_count += len(response.tool_calls)
+                llm = _create_llm(model_config)
 
                 logger.info(
-                    "[%s] %s: Iteration %d — %d tool calls executed",
-                    agent_name, label, iteration + 1, len(response.tool_calls),
+                    "[%s] %s: Starting ReAct loop with %s via %s (attempt %d/%d, tools: %s)",
+                    agent_name, label, model_config.model_id, model_config.provider,
+                    attempt + 1, max_attempts, [t.name for t in tools],
                 )
 
-            # ── Structured output from accumulated messages ─────────
-            # Prepare messages: fix turn ordering & inject JSON hints
-            # for providers that need them.
-            output_messages = _prepare_messages_for_structured_output(
-                messages, model_config.structured_method, output_schema,
-            )
-            structured_llm = _get_structured_llm(
-                llm, output_schema, model_config.structured_method,
-            )
-            result = structured_llm.invoke(output_messages, config=config)
-            elapsed = time.monotonic() - start
+                # ── ReAct tool-calling loop ─────────────────────────
+                llm_with_tools = llm.bind_tools(tools)
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=human_prompt),
+                ]
 
-            logger.info(
-                "[%s] %s: ✅ Complete (%s, %d tool calls, %.1fs)",
-                agent_name, label, model_config.model_id, tool_call_count, elapsed,
-            )
-            return result
+                start = time.monotonic()
+                tool_call_count = 0
 
-        except Exception as exc:
-            error_type = _classify_error(exc)
-            logger.warning(
-                "[%s] %s: ❌ %s from %s: %s",
-                agent_name, label, error_type,
-                model_config.model_id, str(exc)[:200],
-            )
-            last_error = exc
-            continue
+                for iteration in range(MAX_TOOL_ITERATIONS):
+                    response = llm_with_tools.invoke(messages, config=config)
+                    messages.append(response)
+
+                    if not response.tool_calls:
+                        logger.info(
+                            "[%s] %s: LLM done after %d tool calls (%d iterations)",
+                            agent_name, label, tool_call_count, iteration + 1,
+                        )
+                        break
+
+                    # Execute tool calls and feed results back
+                    tool_messages = _execute_tool_calls(response, tools)
+                    messages.extend(tool_messages)
+                    tool_call_count += len(response.tool_calls)
+
+                    logger.info(
+                        "[%s] %s: Iteration %d — %d tool calls executed",
+                        agent_name, label, iteration + 1, len(response.tool_calls),
+                    )
+
+                # ── Structured output from accumulated messages ─────────
+                # Prepare messages: fix turn ordering & inject JSON hints
+                # for providers that need them.
+                output_messages = _prepare_messages_for_structured_output(
+                    messages, model_config.structured_method, output_schema,
+                )
+                structured_llm = _get_structured_llm(
+                    llm, output_schema, model_config.structured_method,
+                )
+                result = structured_llm.invoke(output_messages, config=config)
+                elapsed = time.monotonic() - start
+
+                logger.info(
+                    "[%s] %s: ✅ Complete (%s, %d tool calls, %.1fs)",
+                    agent_name, label, model_config.model_id, tool_call_count, elapsed,
+                )
+                return result
+
+            except Exception as exc:
+                error_type = _classify_error(exc)
+                if model_config.provider == "google" and error_type == "RATE_LIMIT_429" and attempt < max_attempts - 1:
+                    logger.warning(
+                        "[%s] %s: ❌ Rate limit (429) on attempt %d/%d from %s. Rotating Google API key and retrying...",
+                        agent_name, label, attempt + 1, max_attempts, model_config.model_id,
+                    )
+                    _rotate_google_key()
+                    continue
+
+                logger.warning(
+                    "[%s] %s: ❌ %s from %s (attempt %d/%d): %s",
+                    agent_name, label, error_type,
+                    model_config.model_id, attempt + 1, max_attempts, str(exc)[:200],
+                )
+                last_error = exc
+                break
 
     raise RuntimeError(
         f"All models failed for agent '{agent_name}'. Last error: {last_error}"
@@ -553,40 +601,51 @@ def invoke_with_fallback(
         is_fallback = i > 0
         label = "fallback" if is_fallback else "primary"
 
-        try:
-            api_key = _get_api_key(model_config.provider)
-            if not api_key:
-                logger.warning(
-                    "[%s] %s: No API key for %s — skipping",
-                    agent_name, label, model_config.provider,
+        max_attempts = len(settings.google_api_keys) if model_config.provider == "google" else 1
+
+        for attempt in range(max_attempts):
+            try:
+                api_key = _get_api_key(model_config.provider)
+                if not api_key:
+                    logger.warning(
+                        "[%s] %s: No API key for %s — skipping",
+                        agent_name, label, model_config.provider,
+                    )
+                    break
+
+                llm = _create_llm(model_config)
+                structured_llm = _get_structured_llm(
+                    llm, output_schema, model_config.structured_method,
                 )
-                continue
+                chain = prompt_chain | structured_llm
 
-            llm = _create_llm(model_config)
-            structured_llm = _get_structured_llm(
-                llm, output_schema, model_config.structured_method,
-            )
-            chain = prompt_chain | structured_llm
+                start = time.monotonic()
+                result = chain.invoke(input_data, config=config)
+                elapsed = time.monotonic() - start
 
-            start = time.monotonic()
-            result = chain.invoke(input_data, config=config)
-            elapsed = time.monotonic() - start
+                logger.info(
+                    "[%s] %s: ✅ Success (%s, %.1fs)",
+                    agent_name, label, model_config.model_id, elapsed,
+                )
+                return result
 
-            logger.info(
-                "[%s] %s: ✅ Success (%s, %.1fs)",
-                agent_name, label, model_config.model_id, elapsed,
-            )
-            return result
+            except Exception as exc:
+                error_type = _classify_error(exc)
+                if model_config.provider == "google" and error_type == "RATE_LIMIT_429" and attempt < max_attempts - 1:
+                    logger.warning(
+                        "[%s] %s: ❌ Rate limit (429) on attempt %d/%d from %s. Rotating Google API key and retrying...",
+                        agent_name, label, attempt + 1, max_attempts, model_config.model_id,
+                    )
+                    _rotate_google_key()
+                    continue
 
-        except Exception as exc:
-            error_type = _classify_error(exc)
-            logger.warning(
-                "[%s] %s: ❌ %s from %s: %s",
-                agent_name, label, error_type,
-                model_config.model_id, str(exc)[:200],
-            )
-            last_error = exc
-            continue
+                logger.warning(
+                    "[%s] %s: ❌ %s from %s (attempt %d/%d): %s",
+                    agent_name, label, error_type,
+                    model_config.model_id, attempt + 1, max_attempts, str(exc)[:200],
+                )
+                last_error = exc
+                break
 
     raise RuntimeError(
         f"All models failed for agent '{agent_name}'. Last error: {last_error}"

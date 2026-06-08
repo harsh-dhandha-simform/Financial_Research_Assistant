@@ -227,25 +227,9 @@ async def _run_agents_parallel(state: ResearchState) -> dict:
     return output
 
 
-def run_agents_node(state: ResearchState) -> dict:
-    """Run specialist agents in parallel (asyncio.gather).
-
-    Wraps the async parallel runner for LangGraph's sync node interface.
-    Total time ≈ slowest agent instead of sum of all agents.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # Already in an async context (e.g., inside LangGraph async runner)
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(asyncio.run, _run_agents_parallel(state))
-            return future.result()
-    else:
-        return asyncio.run(_run_agents_parallel(state))
+async def run_agents_node(state: ResearchState) -> dict:
+    """Run specialist agents in parallel (asyncio.gather) asynchronously."""
+    return await _run_agents_parallel(state)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

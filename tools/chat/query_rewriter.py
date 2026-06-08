@@ -12,8 +12,6 @@ import logging
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 
-from agents.base import get_llm
-
 logger = logging.getLogger(__name__)
 
 REWRITE_PROMPT = ChatPromptTemplate.from_messages([
@@ -51,6 +49,7 @@ def query_rewriter(question: str, chat_history: str = "") -> str:
         logger.info("query_rewriter: no history, returning as-is")
         return question
 
+    from agents.base import get_llm
     llm = get_llm("news")  # Use a fast model for rewriting
     chain = REWRITE_PROMPT | llm
 

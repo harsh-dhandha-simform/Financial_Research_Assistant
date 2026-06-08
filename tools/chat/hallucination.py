@@ -13,7 +13,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from agents.base import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +65,7 @@ def hallucination_checker(answer: str, source_chunks: str) -> dict:
         Dict with is_grounded (bool), confidence (float),
         and ungrounded_claims (list of strings).
     """
+    from agents.base import get_llm
     llm = get_llm("news")  # Use fast model for checking
     structured_llm = llm.with_structured_output(HallucinationCheck)
     chain = CHECK_PROMPT | structured_llm

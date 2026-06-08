@@ -22,7 +22,7 @@ Usage:
     from retrieval.hybrid_retriever import HybridRetriever
 
     retriever = HybridRetriever(qdrant_store, bm25_retriever)
-    result = retriever.search("Apple revenue growth FY2024", top_k=8)
+    result = retriever.search("Apple revenue growth FY2024", top_k=6)
     print(result.context_text)
 """
 
@@ -122,7 +122,7 @@ class HybridRetriever:
     def search(
         self,
         query: str,
-        top_k: int = 8,
+        top_k: int = 6,
         dense_top_k: int | None = None,
         sparse_top_k: int | None = None,
         section_filter: str | None = None,

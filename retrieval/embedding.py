@@ -37,10 +37,10 @@ logger = logging.getLogger(__name__)
 # Each entry: (name, provider, model_id, dimensions)
 EMBEDDING_CHAIN: list[tuple[str, str, str, int]] = [
     # ── Primary: 1024-dim models ──
-    ("BAAI/bge-m3", "hf_inference", "BAAI/bge-m3", 1024),
-    ("Qwen3-Embedding-0.6B", "hf_local", "Qwen/Qwen3-Embedding-0.6B", 1024),
-    ("OpenAI text-embedding-3-large", "openai", "text-embedding-3-large", 1024),
     ("OpenAI text-embedding-3-small", "openai", "text-embedding-3-small", 1024),
+    ("Qwen3-Embedding-0.6B", "hf_local", "Qwen/Qwen3-Embedding-0.6B", 1024),
+    ("BAAI/bge-m3", "hf_inference", "BAAI/bge-m3", 1024),
+    ("OpenAI text-embedding-3-large", "openai", "text-embedding-3-large", 1024),
     # ── Fallback: different dimensions ──
     ("nomic-embed-text-v1.5", "nomic", "nomic-embed-text-v1.5", 768),
     ("Voyage voyage-4", "voyage", "voyage-4", 1024),
@@ -244,6 +244,7 @@ def _try_openai_embeddings(model_id: str) -> Embeddings | None:
 
         model = OpenAIEmbeddings(
             model=model_id,
+            dimensions=1024,
             openai_api_key=settings.openai_api_key,
             openai_api_base=settings.openai_base_url or None,
         )
