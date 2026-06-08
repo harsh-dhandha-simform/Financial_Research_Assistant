@@ -28,7 +28,7 @@ import logging
 from fastapi import FastAPI
 
 from api.models import HealthResponse
-from api.routers import analyze, ingest, export, agents
+from api.routers import analyze, ingest, export, agents, chat
 from config import settings
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -58,6 +58,7 @@ app.include_router(analyze.router)
 app.include_router(ingest.router)
 app.include_router(export.router)
 app.include_router(agents.router)
+app.include_router(chat.router)
 
 
 # ── Health check ─────────────────────────────────────────────────────────────

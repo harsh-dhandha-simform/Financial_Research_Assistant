@@ -59,6 +59,17 @@ def _run_pipeline(company_name: str, ticker: str, query: str) -> AnalyzeResponse
             from api.routers.export import store_result
             store_result(session_id, state.memo, state.report)
 
+        # Store pipeline context for chat agent
+        if state.synthesis_output:
+            from chat.agent import store_pipeline_context
+            from output.markdown_exporter import memo_to_markdown
+            ctx_parts = [f"Company: {state.company_name} ({state.ticker})"]
+            ctx_parts.append(f"Rating: {state.synthesis_output.rating.value}")
+            ctx_parts.append(f"Thesis: {state.synthesis_output.investment_thesis}")
+            if state.memo:
+                ctx_parts.append(f"\n--- MEMO ---\n{memo_to_markdown(state.memo)}")
+            store_pipeline_context(session_id, "\n".join(ctx_parts))
+
         return AnalyzeResponse(
             session_id=session_id,
             status="complete",
