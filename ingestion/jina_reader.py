@@ -115,10 +115,14 @@ def ingest_url(
     logger.info("Ingesting URL via Jina Reader: %s", url)
 
     # ── Call Jina Reader API ─────────────────────────────────────────────────
+    # Required headers — image + links extraction enabled per Fixes.md
     headers = {
         "Authorization": f"Bearer {settings.jina_api_key}",
         "Accept": "application/json",
-        "X-Return-Format": "markdown",
+        "X-Keep-Img-Data-Url": "true",
+        "X-With-Generated-Alt": "true",
+        "X-With-Images-Summary": "all",
+        "X-With-Links-Summary": "all",
     }
 
     response = requests.get(
@@ -136,6 +140,12 @@ def ingest_url(
     title: str = content_data.get("title", "")
     final_url: str = content_data.get("url", url)
     usage: dict = content_data.get("usage", {})
+
+    # ── Extract image and link metadata ──────────────────────────────────
+    images_data: dict = content_data.get("images", {})
+    # images_data = {image_url: {"alt": "...", "description": "..."}, ...}
+    images_summary: list = content_data.get("imagesData", [])
+    links_summary: list = content_data.get("linksData", [])
 
     if not content.strip():
         raise ValueError(
@@ -160,13 +170,19 @@ def ingest_url(
     # ── Build RawDocument ────────────────────────────────────────────────────
     doc = RawDocument(content=content, metadata=metadata)
 
+    # Attach image and links data as extra attributes for downstream processing
+    doc._jina_images = images_data          # type: ignore[attr-defined]
+    doc._jina_images_summary = images_summary  # type: ignore[attr-defined]
+    doc._jina_links_summary = links_summary    # type: ignore[attr-defined]
+
     token_count = usage.get("tokens", 0)
     logger.info(
-        "Ingested %d chars (%d tokens) from %s — title: %s",
+        "Ingested %d chars (%d tokens) from %s — title: %s, images: %d",
         len(content),
         token_count,
         url,
         title[:80] if title else "(no title)",
+        len(images_data),
     )
 
     return doc

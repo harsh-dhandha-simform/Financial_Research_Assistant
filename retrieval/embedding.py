@@ -37,14 +37,16 @@ logger = logging.getLogger(__name__)
 # Each entry: (name, provider, model_id, dimensions)
 EMBEDDING_CHAIN: list[tuple[str, str, str, int]] = [
     # ── Primary: 1024-dim models ──
+    ("gemini-embedding-001", "google", "models/gemini-embedding-001", 1024),
     ("OpenAI text-embedding-3-small", "openai", "text-embedding-3-small", 1024),
-    ("Qwen3-Embedding-0.6B", "hf_local", "Qwen/Qwen3-Embedding-0.6B", 1024),
     ("BAAI/bge-m3", "hf_inference", "BAAI/bge-m3", 1024),
+    ("Qwen3-Embedding-0.6B", "hf_local", "Qwen/Qwen3-Embedding-0.6B", 1024),
     ("OpenAI text-embedding-3-large", "openai", "text-embedding-3-large", 1024),
     # ── Fallback: different dimensions ──
     ("nomic-embed-text-v1.5", "nomic", "nomic-embed-text-v1.5", 768),
     ("Voyage voyage-4", "voyage", "voyage-4", 1024),
 ]
+
 
 # Cached model info after successful initialization
 _active_model_name: str = ""
@@ -177,7 +179,8 @@ def _try_hf_local_embeddings(model_id: str) -> Embeddings | None:
         model = HuggingFaceEmbeddings(
             model_name=model_id,
             model_kwargs={"device": "cpu", "trust_remote_code": True},
-            encode_kwargs={"normalize_embeddings": True, "batch_size": 64},
+            encode_kwargs={"normalize_embeddings": True, "batch_size": 16},
+            show_progress=True,
         )
         # Verify with a quick test embed
         test_vec = model.embed_query("test")
@@ -261,6 +264,38 @@ def _try_openai_embeddings(model_id: str) -> Embeddings | None:
         return None
 
 
+def _try_google_embeddings(model_id: str) -> Embeddings | None:
+    """Try to create a Google Generative AI embedding model.
+
+    Utilizes the `langchain-google-genai` integration with output_dimensionality.
+    """
+    if not settings.google_api_key:
+        logger.info("Skipping Google embeddings — GOOGLE_API_KEY not set")
+        return None
+
+    try:
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+        # Google's gemini-embedding-001 defaults to 3072 dimensions, but we can
+        # project it down to 1024 dimensions using output_dimensionality for consistency.
+        model = GoogleGenerativeAIEmbeddings(
+            model=model_id,
+            google_api_key=settings.google_api_key,
+            output_dimensionality=1024,
+        )
+        # Verify with a quick test embed
+        test_vec = model.embed_query("test")
+        logger.info(
+            "Google GenAI embeddings ready: %s (%d dims)",
+            model_id,
+            len(test_vec),
+        )
+        return model
+    except Exception as exc:
+        logger.warning("Google GenAI embeddings failed for %s: %s", model_id, exc)
+        return None
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Public API
 # ═════════════════════════════════════════════════════════════════════════════
@@ -284,7 +319,9 @@ def get_embedding_model() -> Embeddings:
     for name, provider, model_id, dimensions in EMBEDDING_CHAIN:
         logger.info("Trying embedding model: %s (%s)", name, provider)
 
-        if provider == "hf_inference":
+        if provider == "google":
+            model = _try_google_embeddings(model_id)
+        elif provider == "hf_inference":
             model = _try_hf_inference_embeddings(model_id)
         elif provider == "hf_local":
             model = _try_hf_local_embeddings(model_id)

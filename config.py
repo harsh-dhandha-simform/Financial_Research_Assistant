@@ -59,6 +59,11 @@ class Settings(BaseModel):
     )
     qdrant_api_key: str = Field(default="", description="Qdrant API key (if secured)")
 
+    # ── Session Store ────────────────────────────────────────────────────────
+    redis_url: str = Field(
+        default="redis://localhost:6379", description="Redis URL for session persistence"
+    )
+
     # ── Web Search ───────────────────────────────────────────────────────────
     tavily_api_key: str = Field(default="", description="Tavily API key for News Agent")
 
@@ -100,6 +105,7 @@ class Settings(BaseModel):
             jina_api_key=os.getenv("JINA_API_KEY", ""),
             qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
             qdrant_api_key=os.getenv("QDRANT_API_KEY", ""),
+            redis_url=os.getenv("REDIS_URL", "redis://localhost:6379"),
             tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
         )
 

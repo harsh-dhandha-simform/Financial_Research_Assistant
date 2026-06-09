@@ -287,10 +287,25 @@ def output_fork_node(state: ResearchState) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+from graph.nodes.query_guardrail import query_guardrail_node
+from graph.nodes.document_gate import document_gate_node
+
+def route_guardrail(state: ResearchState) -> str:
+    """Route based on query guardrail."""
+    if state.guardrail_rejected:
+        return END
+    return "document_gate"
+
+def route_document_gate(state: ResearchState) -> str:
+    """Route based on document gate."""
+    if state.gate_rejected:
+        return END
+    return "supervisor"
+
 def build_research_graph() -> StateGraph:
     """Build and compile the LangGraph research workflow.
 
-    Graph: supervisor → run_agents → synthesis → output_fork → END
+    Graph: query_guardrail → document_gate → supervisor → run_agents → synthesis → output_fork → END
 
     Returns:
         A compiled StateGraph ready for .invoke().
@@ -298,20 +313,26 @@ def build_research_graph() -> StateGraph:
     graph = StateGraph(ResearchState)
 
     # Add nodes
+    graph.add_node("query_guardrail", query_guardrail_node)
+    graph.add_node("document_gate", document_gate_node)
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("run_agents", run_agents_node)
     graph.add_node("synthesis", synthesis_node)
     graph.add_node("output_fork", output_fork_node)
 
     # Define edges
-    graph.set_entry_point("supervisor")
+    graph.set_entry_point("query_guardrail")
+    
+    graph.add_conditional_edges("query_guardrail", route_guardrail)
+    graph.add_conditional_edges("document_gate", route_document_gate)
+    
     graph.add_edge("supervisor", "run_agents")
     graph.add_edge("run_agents", "synthesis")
     graph.add_edge("synthesis", "output_fork")
     graph.add_edge("output_fork", END)
 
     compiled = graph.compile()
-    logger.info("Research graph compiled: supervisor → agents → synthesis → output_fork")
+    logger.info("Research graph compiled: guardrail → gate → supervisor → agents → synthesis → output")
     return compiled
 
 

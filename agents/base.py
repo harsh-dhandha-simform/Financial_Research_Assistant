@@ -119,6 +119,10 @@ AGENT_MODELS: dict[str, list[ModelConfig]] = {
             "llama-3.1-8b-instant", "groq",
             structured_method="json_mode",
         ),
+        ModelConfig(
+            "groq/compound", "groq",
+            structured_method="json_mode",
+        ),
     ],
     "risk": [
         ModelConfig(
