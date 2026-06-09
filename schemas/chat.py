@@ -12,6 +12,8 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from schemas.citation import Citation
+
 
 class MessageRole(str, Enum):
     """Chat message roles."""
@@ -30,9 +32,9 @@ class ChatMessage(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc),
         description="When the message was created",
     )
-    sources: list[str] = Field(
+    sources: list[Citation] = Field(
         default_factory=list,
-        description="Source chunk IDs used to generate this response (assistant only)",
+        description="Source chunks used to generate this response",
     )
     metadata: dict = Field(default_factory=dict, description="Additional metadata")
 
@@ -58,9 +60,9 @@ class ChatResponse(BaseModel):
 
     answer: str = Field(..., description="Generated answer")
     session_id: str = Field(..., description="Session ID for follow-up messages")
-    sources: list[str] = Field(
+    sources: list[Citation] = Field(
         default_factory=list,
-        description="Source chunk IDs used to generate the answer",
+        description="Source chunks used to generate the answer",
     )
     relevant: bool = Field(
         default=True,
