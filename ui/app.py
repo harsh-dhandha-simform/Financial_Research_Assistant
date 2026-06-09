@@ -43,6 +43,25 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Helper: create an Action with payload (Chainlit 2.11+ requires payload)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _action(name: str, label: str) -> cl.Action:
+    """Create a cl.Action with proper payload for Chainlit 2.11+."""
+    return cl.Action(name=name, label=label, payload={"value": name})
+
+
+def _get_action_value(res: dict | None) -> str | None:
+    """Extract the action value from an AskActionMessage response."""
+    if not res:
+        return None
+    payload = res.get("payload", {})
+    if isinstance(payload, dict):
+        return payload.get("value")
+    return res.get("name")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Chat Profiles — two modes
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -74,6 +93,11 @@ def _chunk_and_store(raw_doc) -> dict:
     parent_lookup = {p.chunk_id: p for p in parents}
     store = QdrantStore()
     stored = store.upsert_chunks(children, parent_lookup)
+
+    # Build BM25 index from the newly ingested chunks so hybrid retrieval works
+    from tools.retriever import rebuild_bm25_index
+    rebuild_bm25_index()
+
     return {
         "pages": len(raw_doc.pages),
         "parents": len(parents),
@@ -96,7 +120,6 @@ async def on_start():
     cl.user_session.set("company_name", "")
     cl.user_session.set("ticker", "")
     cl.user_session.set("ingested", False)
-    # Store memo/report objects (not just markdown) for export
     cl.user_session.set("memo_obj", None)
     cl.user_session.set("report_obj", None)
 
@@ -194,7 +217,6 @@ async def on_message(message: cl.Message):
     if profile == "Chat Q&A":
         await _handle_chat(user_input, session_id)
     else:
-        # Research Pipeline
         await _handle_research_input(message, user_input, session_id)
 
 
@@ -239,26 +261,29 @@ async def _handle_pdf_upload(element, session_id: str, user_input: str):
             file_name=filename,
             company_name=company_name,
         )
+
+        await cl.Message(content=f"📄 Extracted **{len(raw_doc.pages)} pages** — now chunking & storing...").send()
+
         stats = _chunk_and_store(raw_doc)
 
         cl.user_session.set("ingested", True)
         cl.user_session.set("company_name", company_name)
 
-        msg.content = (
-            f"✅ **Ingested `{filename}`**\n\n"
-            f"| Metric | Count |\n|--------|-------|\n"
-            f"| Pages extracted | **{stats['pages']}** |\n"
-            f"| Parent chunks | **{stats['parents']}** |\n"
-            f"| Child chunks | **{stats['children']}** |\n"
-            f"| Stored in Qdrant | **{stats['stored']}** |\n\n"
-            f"Now type the **company name and ticker** to run analysis.\n"
-            f"Example: `{company_name} AAPL`"
-        )
-        await msg.update()
+        await cl.Message(
+            content=(
+                f"✅ **Ingested `{filename}`**\n\n"
+                f"| Metric | Count |\n|--------|-------|\n"
+                f"| Pages extracted | **{stats['pages']}** |\n"
+                f"| Parent chunks | **{stats['parents']}** |\n"
+                f"| Child chunks | **{stats['children']}** |\n"
+                f"| Stored in Qdrant | **{stats['stored']}** |\n\n"
+                f"Now type the **company name and ticker** to run analysis.\n"
+                f"Example: `{company_name} AAPL`"
+            )
+        ).send()
 
     except Exception as exc:
-        msg.content = f"❌ **Ingestion failed:** {exc}"
-        await msg.update()
+        await cl.Message(content=f"❌ **Ingestion failed:** {exc}").send()
         logger.error("PDF upload ingestion failed: %s", exc)
 
 
@@ -278,34 +303,35 @@ async def _handle_ingest_url(user_input: str, session_id: str):
     try:
         company_name = cl.user_session.get("company_name") or "Unknown"
         raw_doc = ingest_url(url=url, company_name=company_name)
-        stats = _chunk_and_store(raw_doc)
 
+        await cl.Message(content=f"📄 Extracted **{len(raw_doc.pages)} pages** — now chunking & storing...").send()
+
+        stats = _chunk_and_store(raw_doc)
         cl.user_session.set("ingested", True)
 
-        msg.content = (
-            f"✅ **URL ingested**\n\n"
-            f"| Metric | Count |\n|--------|-------|\n"
-            f"| Pages extracted | **{stats['pages']}** |\n"
-            f"| Parent chunks | **{stats['parents']}** |\n"
-            f"| Child chunks | **{stats['children']}** |\n"
-            f"| Stored in Qdrant | **{stats['stored']}** |\n\n"
-            f"Now type the **company name and ticker** to run analysis."
-        )
-        await msg.update()
+        await cl.Message(
+            content=(
+                f"✅ **URL ingested**\n\n"
+                f"| Metric | Count |\n|--------|-------|\n"
+                f"| Pages extracted | **{stats['pages']}** |\n"
+                f"| Parent chunks | **{stats['parents']}** |\n"
+                f"| Child chunks | **{stats['children']}** |\n"
+                f"| Stored in Qdrant | **{stats['stored']}** |\n\n"
+                f"Now type the **company name and ticker** to run analysis."
+            )
+        ).send()
 
     except Exception as exc:
-        msg.content = f"❌ **URL ingestion failed:** {exc}"
-        await msg.update()
+        await cl.Message(content=f"❌ **URL ingestion failed:** {exc}").send()
         logger.error("URL ingestion failed: %s", exc)
 
 
 async def _handle_analyze(user_input: str, session_id: str):
-    """Run the full research pipeline, then present the Output Fork."""
+    """Run the full research pipeline with progress updates, then present the Output Fork."""
     words = user_input.split()
     ticker = ""
     company_name = user_input
 
-    # Try to extract ticker (last word if uppercase and <= 5 chars)
     if len(words) >= 2 and words[-1].isupper() and len(words[-1]) <= 5:
         ticker = words[-1]
         company_name = " ".join(words[:-1])
@@ -316,22 +342,107 @@ async def _handle_analyze(user_input: str, session_id: str):
     ingested = cl.user_session.get("ingested")
     ingest_note = "" if ingested else "\n⚠️ *No documents ingested — agents will rely on web search.*"
 
-    msg = cl.Message(
+    # ── Progress: Starting ────────────────────────────────────────────
+    await cl.Message(
         content=(
             f"🔬 **Analysing {company_name} ({ticker or 'no ticker'})...**\n\n"
             f"Running 4 agents in parallel: Metrics · Risk · News · Synthesis\n"
             f"This takes 30-60 seconds.{ingest_note}"
         )
-    )
-    await msg.send()
+    ).send()
 
     try:
-        state = run_research(
+        from graph.workflow import build_research_graph
+        from graph.state import ResearchState
+        from agents.base import create_langfuse_config
+
+        # ── Progress: Supervisor ──────────────────────────────────────
+        await cl.Message(content="🧠 **Step 1/4** — Supervisor deciding agent routing...").send()
+
+        graph = build_research_graph()
+        initial_state = ResearchState(
             query=f"Analyse the latest SEC filings for {company_name} ({ticker})",
             company_name=company_name,
             ticker=ticker,
-            session_id=session_id,
+            session_id=session_id or f"research-{company_name.lower().replace(' ', '-')}",
         )
+        config = create_langfuse_config(
+            session_id=initial_state.session_id,
+            trace_name="research-pipeline",
+        )
+
+        state_dict = initial_state.model_dump()
+
+        async for event in graph.astream(state_dict, config=config):
+            for node_name, state_update in event.items():
+                if node_name == "supervisor":
+                    decision = state_update.get("supervisor_decision")
+                    if decision:
+                        tasks = getattr(decision, "tasks", [])
+                        if not tasks and isinstance(decision, dict):
+                            tasks = decision.get("tasks", [])
+                        
+                        task_names = []
+                        for t in tasks:
+                            if isinstance(t, dict):
+                                name = t.get("agent_name", "")
+                            else:
+                                name = getattr(t, "agent_name", "")
+                            if name:
+                                task_names.append(f"`{name}`")
+                        
+                        tasks_str = ", ".join(task_names)
+                        if tasks_str:
+                            await cl.Message(
+                                content=f"⚙️ **Step 2/4** — Supervisor assigned tasks: {tasks_str}. Running specialist agents in parallel..."
+                            ).send()
+                        else:
+                            await cl.Message(
+                                content="⚙️ **Step 2/4** — Running specialist agents in parallel..."
+                            ).send()
+                    else:
+                        await cl.Message(
+                            content="⚙️ **Step 2/4** — Running specialist agents in parallel..."
+                        ).send()
+                elif node_name == "run_agents":
+                    await cl.Message(
+                        content="📝 **Step 3/4** — Specialist agents complete. Synthesis Agent combining results..."
+                    ).send()
+                elif node_name == "synthesis":
+                    await cl.Message(
+                        content="📋📑 **Step 4/4** — Synthesis complete. Formatting memo and report templates..."
+                    ).send()
+
+                # Merge the updates into state_dict
+                state_dict.update(state_update)
+
+        state = ResearchState(**state_dict)
+
+        # ── Progress: Results ─────────────────────────────────────────
+        results_parts = []
+        if state.metrics_output:
+            results_parts.append("✅ Metrics Agent")
+        else:
+            results_parts.append("⚠️ Metrics Agent (failed or skipped)")
+
+        if state.risk_output:
+            results_parts.append(f"✅ Risk Agent ({len(state.risk_output.risks)} risks found)")
+        else:
+            results_parts.append("⚠️ Risk Agent (failed or skipped)")
+
+        if state.news_output:
+            results_parts.append(f"✅ News Agent ({len(state.news_output.articles)} articles)")
+        else:
+            results_parts.append("⚠️ News Agent (failed or skipped)")
+
+        if state.synthesis_output:
+            results_parts.append("✅ Synthesis Agent")
+        else:
+            results_parts.append("❌ Synthesis Agent (failed)")
+
+        await cl.Message(
+            content="**Agent Results:**\n" + "\n".join(f"- {r}" for r in results_parts)
+        ).send()
 
         # Store pipeline context for the Chat Q&A profile
         if state.synthesis_output:
@@ -376,22 +487,12 @@ async def _handle_analyze(user_input: str, session_id: str):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Output Fork — interactive user choice
+# Output Fork — interactive user choice (uses payload for Chainlit 2.11+)
 # ═════════════════════════════════════════════════════════════════════════════
 
 
 async def _present_output_fork():
-    """Present the Output Fork as interactive buttons.
-
-    The user chooses how they want to view/export the results:
-      - View Memo (markdown in chat)
-      - View Report (markdown in chat)
-      - View Both
-      - Export Memo as DOCX
-      - Export Memo as PDF
-      - Export Report as DOCX
-      - Export Report as PDF
-    """
+    """Present the Output Fork as interactive buttons."""
     memo_obj = cl.user_session.get("memo_obj")
     report_obj = cl.user_session.get("report_obj")
 
@@ -401,19 +502,17 @@ async def _present_output_fork():
 
     actions = []
     if memo_obj:
-        actions.append(cl.Action(name="view_memo", label="📋 View Investment Memo", value="view_memo"))
+        actions.append(_action("view_memo", "📋 View Investment Memo"))
     if report_obj:
-        actions.append(cl.Action(name="view_report", label="📑 View Full Report", value="view_report"))
+        actions.append(_action("view_report", "📑 View Full Report"))
     if memo_obj and report_obj:
-        actions.append(cl.Action(name="view_both", label="📋📑 View Both", value="view_both"))
-
-    # Export options
+        actions.append(_action("view_both", "📋📑 View Both"))
     if memo_obj:
-        actions.append(cl.Action(name="export_memo_docx", label="📥 Export Memo (DOCX)", value="export_memo_docx"))
-        actions.append(cl.Action(name="export_memo_pdf", label="📥 Export Memo (PDF)", value="export_memo_pdf"))
+        actions.append(_action("export_memo_docx", "📥 Export Memo (DOCX)"))
+        actions.append(_action("export_memo_pdf", "📥 Export Memo (PDF)"))
     if report_obj:
-        actions.append(cl.Action(name="export_report_docx", label="📥 Export Report (DOCX)", value="export_report_docx"))
-        actions.append(cl.Action(name="export_report_pdf", label="📥 Export Report (PDF)", value="export_report_pdf"))
+        actions.append(_action("export_report_docx", "📥 Export Report (DOCX)"))
+        actions.append(_action("export_report_pdf", "📥 Export Report (PDF)"))
 
     res = await cl.AskActionMessage(
         content=(
@@ -429,8 +528,9 @@ async def _present_output_fork():
         timeout=300,
     ).send()
 
-    if res:
-        await _handle_output_fork_choice(res.get("value"))
+    choice = _get_action_value(res)
+    if choice:
+        await _handle_output_fork_choice(choice)
 
 
 async def _handle_output_fork_choice(choice: str):
@@ -438,7 +538,6 @@ async def _handle_output_fork_choice(choice: str):
     memo_obj = cl.user_session.get("memo_obj")
     report_obj = cl.user_session.get("report_obj")
     company = cl.user_session.get("company_name") or "company"
-    ticker = cl.user_session.get("ticker") or ""
     safe_name = company.replace(" ", "_").lower()
 
     if choice == "view_memo" and memo_obj:
@@ -461,25 +560,25 @@ async def _handle_output_fork_choice(choice: str):
         path = os.path.join(EXPORT_DIR, f"{safe_name}_memo.docx")
         memo_to_docx(memo_obj, path)
         elements = [cl.File(name=f"{safe_name}_memo.docx", path=path, display="inline")]
-        await cl.Message(content=f"📥 **Investment Memo — DOCX**", elements=elements).send()
+        await cl.Message(content="📥 **Investment Memo — DOCX**", elements=elements).send()
 
     elif choice == "export_memo_pdf" and memo_obj:
         path = os.path.join(EXPORT_DIR, f"{safe_name}_memo.pdf")
         memo_to_pdf(memo_obj, path)
         elements = [cl.File(name=f"{safe_name}_memo.pdf", path=path, display="inline")]
-        await cl.Message(content=f"📥 **Investment Memo — PDF**", elements=elements).send()
+        await cl.Message(content="📥 **Investment Memo — PDF**", elements=elements).send()
 
     elif choice == "export_report_docx" and report_obj:
         path = os.path.join(EXPORT_DIR, f"{safe_name}_report.docx")
         report_to_docx(report_obj, path)
         elements = [cl.File(name=f"{safe_name}_report.docx", path=path, display="inline")]
-        await cl.Message(content=f"📥 **Research Report — DOCX**", elements=elements).send()
+        await cl.Message(content="📥 **Research Report — DOCX**", elements=elements).send()
 
     elif choice == "export_report_pdf" and report_obj:
         path = os.path.join(EXPORT_DIR, f"{safe_name}_report.pdf")
         report_to_pdf(report_obj, path)
         elements = [cl.File(name=f"{safe_name}_report.pdf", path=path, display="inline")]
-        await cl.Message(content=f"📥 **Research Report — PDF**", elements=elements).send()
+        await cl.Message(content="📥 **Research Report — PDF**", elements=elements).send()
 
     else:
         await cl.Message(content="⚠️ That output is not available.").send()
@@ -496,13 +595,13 @@ async def _offer_followup_actions():
 
     actions = []
     if memo_obj:
-        actions.append(cl.Action(name="view_memo", label="📋 View Memo", value="view_memo"))
-        actions.append(cl.Action(name="export_memo_docx", label="📥 Memo DOCX", value="export_memo_docx"))
-        actions.append(cl.Action(name="export_memo_pdf", label="📥 Memo PDF", value="export_memo_pdf"))
+        actions.append(_action("view_memo", "📋 View Memo"))
+        actions.append(_action("export_memo_docx", "📥 Memo DOCX"))
+        actions.append(_action("export_memo_pdf", "📥 Memo PDF"))
     if report_obj:
-        actions.append(cl.Action(name="view_report", label="📑 View Report", value="view_report"))
-        actions.append(cl.Action(name="export_report_docx", label="📥 Report DOCX", value="export_report_docx"))
-        actions.append(cl.Action(name="export_report_pdf", label="📥 Report PDF", value="export_report_pdf"))
+        actions.append(_action("view_report", "📑 View Report"))
+        actions.append(_action("export_report_docx", "📥 Report DOCX"))
+        actions.append(_action("export_report_pdf", "📥 Report PDF"))
 
     if not actions:
         return
@@ -513,8 +612,9 @@ async def _offer_followup_actions():
         timeout=120,
     ).send()
 
-    if res:
-        await _handle_output_fork_choice(res.get("value"))
+    choice = _get_action_value(res)
+    if choice:
+        await _handle_output_fork_choice(choice)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -535,7 +635,6 @@ async def _handle_chat(question: str, session_id: str):
 
         answer = response.answer
 
-        # Add sources if available
         if response.sources and response.relevant:
             answer += "\n\n---\n📚 **Sources:**\n"
             for src in response.sources[:5]:

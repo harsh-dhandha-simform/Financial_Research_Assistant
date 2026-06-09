@@ -57,7 +57,7 @@ class RetrievalResult(BaseModel):
     total_candidates: int = Field(
         default=0, description="Total chunks scored before top-k cutoff"
     )
-    top_k: int = Field(default=8, description="Number of chunks returned")
+    top_k: int = Field(default=6, description="Number of chunks returned")
 
     @property
     def context_text(self) -> str:

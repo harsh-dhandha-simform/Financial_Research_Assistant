@@ -13,7 +13,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from agents.base import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -64,16 +63,29 @@ def risk_classifier(risk_text: str) -> dict:
     Returns:
         Dict with category, risk_level, and confidence.
     """
-    llm = get_llm("risk")
-    structured_llm = llm.with_structured_output(RiskClassification)
-    chain = CLASSIFY_PROMPT | structured_llm
+    try:
+        from agents.base import get_llm
+        llm = get_llm("risk")
+        # Use json_mode explicitly — featherless-ai doesn't support
+        # json_schema without providing the full schema definition.
+        structured_llm = llm.with_structured_output(
+            RiskClassification, method="json_mode"
+        )
+        chain = CLASSIFY_PROMPT | structured_llm
 
-    result = chain.invoke({"risk_text": risk_text})
+        result = chain.invoke({"risk_text": risk_text})
 
-    logger.info(
-        "risk_classifier: category=%s, level=%s, confidence=%.2f",
-        result.category,
-        result.risk_level,
-        result.confidence,
-    )
-    return result.model_dump()
+        logger.info(
+            "risk_classifier: category=%s, level=%s, confidence=%.2f",
+            result.category,
+            result.risk_level,
+            result.confidence,
+        )
+        return result.model_dump()
+    except Exception as exc:
+        logger.warning("risk_classifier failed: %s — returning default", exc)
+        return {
+            "category": "other",
+            "risk_level": "medium",
+            "confidence": 0.0,
+        }

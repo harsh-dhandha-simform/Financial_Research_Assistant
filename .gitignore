@@ -6,3 +6,5 @@ __pycache__/
 /context
 /test/output/
 .chainlit/
+/test/as.py
+/test/em.py

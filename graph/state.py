@@ -73,8 +73,11 @@ class ResearchState(BaseModel):
     memo: InvestmentMemo | None = None
     report: ResearchReport | None = None
 
-    # ── Error tracking ───────────────────────────────────────────────────────
+    # ── Error tracking & Guardrails ──────────────────────────────────────────
     errors: list[str] = []
+    guardrail_rejected: bool = False
+    rejection_message: str = ""
+    gate_rejected: bool = False
 
     class Config:
         arbitrary_types_allowed = True
