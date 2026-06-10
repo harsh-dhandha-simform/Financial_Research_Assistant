@@ -7,12 +7,13 @@ or inappropriate, it returns a rejection message immediately.
 
 import json
 import logging
-from typing import tuple
+from typing import Tuple
 
 from langchain_openai import ChatOpenAI
 
 from config import settings
 from callbacks import get_langfuse_handler
+from langfuse.decorators import observe
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,8 @@ or general chitchat), respond with:
 Output MUST be valid JSON only.
 """
 
-def check_chat_guardrail(question: str, session_id: str) -> tuple[bool, str]:
+@observe()
+def check_chat_guardrail(question: str, session_id: str) -> Tuple[bool, str]:
     """Check if a chat question is valid before performing RAG.
     
     Returns:
@@ -43,7 +45,7 @@ def check_chat_guardrail(question: str, session_id: str) -> tuple[bool, str]:
     llm = ChatOpenAI(
         base_url="https://api.groq.com/openai/v1",
         api_key=settings.groq_api_key,
-        model="compound-mini",
+        model="llama-3.1-8b-instant",
         temperature=0,
         max_tokens=150,
     )

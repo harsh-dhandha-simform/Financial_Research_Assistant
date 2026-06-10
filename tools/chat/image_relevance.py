@@ -12,6 +12,7 @@ from typing import Optional
 
 from retrieval.embedding import get_embedding_model
 from schemas.citation import Citation
+from langfuse.decorators import observe
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ def cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
     return float(np.dot(v1, v2) / (norm1 * norm2))
 
 
+@observe()
 def check_image_relevance(
     query: str,
     citation: Citation,

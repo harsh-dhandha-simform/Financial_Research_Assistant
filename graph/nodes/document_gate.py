@@ -11,9 +11,11 @@ import logging
 from typing import Any
 
 from graph.state import ResearchState
+from langfuse.decorators import observe
 
 logger = logging.getLogger(__name__)
 
+@observe()
 def document_gate_node(state: ResearchState) -> dict[str, Any]:
     """Check if the pipeline has what it needs to proceed."""
     logger.info("Document Gate: checking readiness for %s", state.company_name)

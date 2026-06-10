@@ -59,9 +59,12 @@ class Settings(BaseModel):
     )
     qdrant_api_key: str = Field(default="", description="Qdrant API key (if secured)")
 
-    # ── Session Store ────────────────────────────────────────────────────────
+    # ── Session Store & Database ─────────────────────────────────────────────
     redis_url: str = Field(
         default="redis://localhost:6379", description="Redis URL for session persistence"
+    )
+    supabase_uri: str = Field(
+        default="", description="Supabase Postgres connection URI"
     )
 
     # ── Web Search ───────────────────────────────────────────────────────────
@@ -106,6 +109,7 @@ class Settings(BaseModel):
             qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
             qdrant_api_key=os.getenv("QDRANT_API_KEY", ""),
             redis_url=os.getenv("REDIS_URL", "redis://localhost:6379"),
+            supabase_uri=f"postgresql+asyncpg://postgres.cakvdlozssbxxpfvsrsj:{os.getenv('DB_PASS', '')}@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres",
             tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
         )
 

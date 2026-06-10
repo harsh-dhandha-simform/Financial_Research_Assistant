@@ -55,14 +55,16 @@ RULES:
 4. If the query is about news/sentiment, at minimum invoke "news".
 5. Always include a focused query tailored for each agent.
 6. Set context_needed=True for metrics and risk (they use RAG). Set False for news.
+7. You must provide a "reasoning" for your selection.
+8. You must include the "company_name", "ticker", and "original_query" exactly as provided.
 """
 
 SUPERVISOR_HUMAN = """\
-User query: {query}
-Company: {company_name}
-Ticker: {ticker}
+User query (original_query): {query}
+Company (company_name): {company_name}
+Ticker (ticker): {ticker}
 
-Decide which agents to invoke and provide focused queries for each.
+Decide which agents to invoke and output the JSON strictly adhering to the SupervisorDecision schema.
 """
 
 SUPERVISOR_PROMPT = ChatPromptTemplate.from_messages([
@@ -341,7 +343,7 @@ def build_research_graph() -> StateGraph:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def run_research(
+async def run_research(
     query: str,
     company_name: str,
     ticker: str = "",
@@ -377,7 +379,7 @@ def run_research(
         query, company_name, ticker,
     )
 
-    result = graph.invoke(initial_state.model_dump(), config=config)
+    result = await graph.ainvoke(initial_state.model_dump(), config=config)
     final_state = ResearchState(**result)
 
     logger.info(

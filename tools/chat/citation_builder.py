@@ -4,7 +4,9 @@ Citation Builder — transforms LangChain Documents into rich Citation objects.
 
 from langchain_core.documents import Document
 from schemas.citation import Citation
+from langfuse.decorators import observe
 
+@observe()
 def build_citations(docs: list[Document]) -> list[Citation]:
     """Convert retrieved LangChain Documents into rich Citation objects.
     

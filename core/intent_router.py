@@ -2,7 +2,7 @@
 Intent Router — determines the goal of the user's input.
 
 Replaces the old "two-tab" UI design with a single unified orchestrator.
-Uses Groq's llama-3.3-70b-versatile (or compound-mini) to classify user input.
+Uses Groq's llama-3.3-70b-versatile (or llama-3.1-8b-instant) to classify user input.
 
 Intents:
   FULL_PIPELINE   : "Analyse Apple's latest 10-K"
@@ -18,12 +18,15 @@ Intents:
 import json
 import logging
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
 
 from langchain_openai import ChatOpenAI
 
 from config import settings
 from callbacks import get_langfuse_handler
+from langfuse.decorators import observe
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +45,15 @@ class UserIntent(str, Enum):
 # We use a 70B model or similar for reliable structured routing
 ROUTER_MODEL = "llama-3.3-70b-versatile"
 # Fallback to faster model if needed
-FALLBACK_MODEL = "compound-mini"
+FALLBACK_MODEL = "llama-3.1-8b-instant"
+
+
+class IntentResult(BaseModel):
+    """Structured output from the intent router."""
+    intent: str = Field(..., description="One of the UserIntent values")
+    confidence: float = Field(default=0.9, ge=0.0, le=1.0, description="Confidence score")
+    extracted_entity: Optional[str] = Field(default=None, description="Company name, URL, agent name, etc.")
+    reasoning: str = Field(default="", description="Step-by-step thought before classification")
 
 ROUTER_SYSTEM_PROMPT = """You are the central intent router for a Financial Research Assistant.
 Your job is to read the user's input and classify their intent into exactly one of the allowed categories.
@@ -67,17 +78,32 @@ Respond ONLY in valid JSON with the following schema:
 }
 """
 
-def route_intent(user_input: str, session_id: str = "") -> dict[str, Any]:
-    """Classify the user's input into a specific intent."""
+@observe(as_type="generation")
+def route_intent(user_input: str, session_id: str = "") -> IntentResult:
+    """Classify the user's input into a specific intent.
+    
+    Returns:
+        IntentResult with intent, confidence, extracted_entity, and reasoning.
+    """
     logger.info("Routing intent for input: '%s'", user_input[:80])
 
     if not settings.groq_api_key:
         logger.warning("GROQ_API_KEY missing — defaulting to RAG_CHAT")
-        return {"intent": UserIntent.RAG_CHAT.value, "reasoning": "No Groq key"}
+        return IntentResult(
+            intent=UserIntent.RAG_CHAT.value,
+            confidence=0.5,
+            reasoning="No Groq key — defaulting",
+        )
 
     # Special case handling for explicit commands
     if user_input.lower().startswith("/ingest"):
-        return {"intent": UserIntent.INGEST_DOC.value, "reasoning": "Explicit /ingest command"}
+        url = user_input.split(maxsplit=1)[1].strip() if len(user_input.split()) > 1 else ""
+        return IntentResult(
+            intent=UserIntent.INGEST_DOC.value,
+            confidence=1.0,
+            extracted_entity=url or None,
+            reasoning="Explicit /ingest command",
+        )
 
     llm = ChatOpenAI(
         base_url="https://api.groq.com/openai/v1",
@@ -109,19 +135,26 @@ def route_intent(user_input: str, session_id: str = "") -> dict[str, Any]:
             intent = UserIntent(intent_str)
         except ValueError:
             intent = UserIntent.RAG_CHAT
-            
-        result["intent"] = intent.value
         
-        logger.info(
-            "Intent router classified as %s (company: %s)",
-            result["intent"], result.get("extracted_company")
+        # Build structured result
+        intent_result = IntentResult(
+            intent=intent.value,
+            confidence=float(result.get("confidence", 0.9)),
+            extracted_entity=result.get("extracted_company") or result.get("target_agent"),
+            reasoning=result.get("reasoning", ""),
         )
         
-        return result
+        logger.info(
+            "Intent router classified as %s (confidence: %.2f, entity: %s)",
+            intent_result.intent, intent_result.confidence, intent_result.extracted_entity,
+        )
+        
+        return intent_result
 
     except Exception as exc:
         logger.warning("Intent routing failed: %s — falling back to RAG_CHAT", exc)
-        return {
-            "intent": UserIntent.RAG_CHAT.value,
-            "reasoning": f"Routing error: {exc}"
-        }
+        return IntentResult(
+            intent=UserIntent.RAG_CHAT.value,
+            confidence=0.3,
+            reasoning=f"Routing error: {exc}",
+        )

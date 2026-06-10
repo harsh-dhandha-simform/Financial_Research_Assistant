@@ -11,6 +11,7 @@ Usage:
 
 import logging
 from urllib.parse import urlparse
+from langfuse.decorators import observe
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ def is_blocked_domain(url: str) -> bool:
     return any(netloc.endswith(d) for d in BLOCKED_DOMAINS)
 
 
+@observe()
 def validate_url_domain(url: str) -> tuple[bool, str]:
     """Stage 1: Pre-fetch domain validation.
 
@@ -110,11 +112,12 @@ def validate_url_domain(url: str) -> tuple[bool, str]:
 # ── Stage 2: Content-level validation (LLM) ─────────────────────────────────
 
 
+@observe(as_type="generation")
 async def validate_document_content(
     content_preview: str,
     url: str = "",
 ) -> tuple[bool, str]:
-    """Stage 2: Post-fetch content validation using groq/compound-mini.
+    """Stage 2: Post-fetch content validation using groq/llama-3.1-8b-instant.
 
     Passes the first 2000 chars to the LLM to determine if the document
     is a financial filing, annual report, prospectus, earnings release,
@@ -139,7 +142,7 @@ async def validate_document_content(
         guardrail_llm = ChatOpenAI(
             base_url="https://api.groq.com/openai/v1",
             api_key=settings.groq_api_key,
-            model="compound-mini",
+            model="llama-3.1-8b-instant",
             temperature=0,
             max_tokens=150,
         )

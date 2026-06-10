@@ -1,0 +1,196 @@
+/* Financial Research Assistant — Dark Theme
+ *
+ * Color palette: deep navy + gold accent + electric blue.
+ * Typography: Inter (body), DM Serif Display (headings), IBM Plex Mono (data).
+ * Reference: Fixes.md Change 9
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@300;400;500;600;700&display=swap');
+
+:root {
+  /* ── Core palette ──────────────────────────────────────────── */
+  --bg-primary:    #0A0F1E;
+  --bg-secondary:  #111827;
+  --bg-card:       #1A2234;
+  --accent-gold:   #C9A84C;
+  --accent-blue:   #2D6BFF;
+  --text-primary:  #F0F4FF;
+  --text-muted:    #8B9DB8;
+  --border:        #1E2D45;
+  --success:       #10B981;
+  --warning:       #F59E0B;
+  --danger:        #EF4444;
+
+  /* ── Shadows ───────────────────────────────────────────────── */
+  --shadow-sm:     0 1px 2px rgba(0,0,0,0.3);
+  --shadow-md:     0 4px 12px rgba(0,0,0,0.4);
+  --shadow-lg:     0 8px 24px rgba(0,0,0,0.5);
+}
+
+/* ── Global overrides ──────────────────────────────────────────── */
+body {
+  font-family: 'Inter', system-ui, sans-serif !important;
+  background: var(--bg-primary) !important;
+  color: var(--text-primary) !important;
+}
+
+/* ── Chat messages ─────────────────────────────────────────────── */
+.cl-message {
+  border-radius: 12px;
+  margin-bottom: 8px;
+}
+
+/* User messages */
+.cl-message--user .cl-message-content {
+  background: linear-gradient(135deg, var(--accent-blue), #1a47b3) !important;
+  color: white !important;
+  border-radius: 16px 16px 4px 16px;
+}
+
+/* Assistant messages */
+.cl-message--assistant .cl-message-content {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 16px 16px 16px 4px;
+  color: var(--text-primary) !important;
+}
+
+/* ── Sidebar / Header ──────────────────────────────────────────── */
+.cl-sidebar,
+.cl-header {
+  background: var(--bg-secondary) !important;
+  border-color: var(--border) !important;
+}
+
+.cl-header {
+  border-bottom: 1px solid var(--border) !important;
+}
+
+/* ── Input area ────────────────────────────────────────────────── */
+.cl-textarea-container {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 12px !important;
+}
+
+.cl-textarea-container:focus-within {
+  border-color: var(--accent-gold) !important;
+  box-shadow: 0 0 0 2px rgba(201, 168, 76, 0.2) !important;
+}
+
+/* ── Action buttons ────────────────────────────────────────────── */
+.cl-action-button {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text-primary) !important;
+  border-radius: 8px !important;
+  padding: 8px 16px !important;
+  font-family: 'Inter', sans-serif !important;
+  font-weight: 500 !important;
+  transition: all 0.2s ease !important;
+}
+
+.cl-action-button:hover {
+  border-color: var(--accent-gold) !important;
+  background: rgba(201, 168, 76, 0.1) !important;
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm) !important;
+}
+
+/* ── Steps (Agent Activity Feed) ───────────────────────────────── */
+.cl-step {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  margin: 4px 0 !important;
+}
+
+.cl-step-header {
+  color: var(--accent-gold) !important;
+  font-family: 'IBM Plex Mono', monospace !important;
+  font-size: 0.85rem !important;
+}
+
+/* ── Code blocks ───────────────────────────────────────────────── */
+pre, code {
+  font-family: 'IBM Plex Mono', monospace !important;
+  background: var(--bg-secondary) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 6px !important;
+}
+
+/* ── Tables (for financial data) ───────────────────────────────── */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+}
+
+th {
+  background: var(--bg-secondary) !important;
+  color: var(--accent-gold) !important;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.85rem;
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 2px solid var(--accent-gold);
+}
+
+td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-primary);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.85rem;
+}
+
+tr:hover td {
+  background: rgba(45, 107, 255, 0.05);
+}
+
+/* ── Scrollbar ─────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* ── Status badges ─────────────────────────────────────────────── */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-family: 'IBM Plex Mono', monospace;
+}
+.badge-pdf     { background: rgba(239, 68, 68, 0.15); color: #EF4444; border: 1px solid rgba(239, 68, 68, 0.3); }
+.badge-edgar   { background: rgba(201, 168, 76, 0.15); color: #C9A84C; border: 1px solid rgba(201, 168, 76, 0.3); }
+.badge-web     { background: rgba(45, 107, 255, 0.15); color: #2D6BFF; border: 1px solid rgba(45, 107, 255, 0.3); }
+.badge-image   { background: rgba(16, 185, 129, 0.15); color: #10B981; border: 1px solid rgba(16, 185, 129, 0.3); }
+
+/* ── Loading animation for pipeline ────────────────────────────── */
+@keyframes pulse-gold {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.loading-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-gold);
+  animation: pulse-gold 1.5s ease-in-out infinite;
+}
+
+.loading-dot:nth-child(2) { animation-delay: 0.3s; }
+.loading-dot:nth-child(3) { animation-delay: 0.6s; }

@@ -17,6 +17,7 @@ import base64
 import logging
 import os
 from typing import Optional
+from langfuse.decorators import observe
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ def _image_to_base64_url(image_path: str) -> str:
     return f"data:{mime};base64,{data}"
 
 
+@observe(as_type="generation")
 def describe_image(
     image_path_or_url: str,
     context: str = "",

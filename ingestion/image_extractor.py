@@ -16,6 +16,7 @@ import logging
 import os
 
 import fitz  # PyMuPDF
+from langfuse.decorators import observe
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 IMAGES_BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "images")
 
 
+@observe()
 def extract_images_from_pdf(
     pdf_path: str,
     session_id: str,
