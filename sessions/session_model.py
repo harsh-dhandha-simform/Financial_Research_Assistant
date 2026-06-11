@@ -62,6 +62,7 @@ class UserSession:
     # Active analysis context
     company_name: str = ""
     ticker: str = ""
+    user_identifier: str = ""
 
     def __post_init__(self):
         """Set collection_name from session_id if not provided."""

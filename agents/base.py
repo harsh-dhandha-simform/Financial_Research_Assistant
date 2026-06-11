@@ -112,27 +112,28 @@ class ModelConfig:
 AGENT_MODELS: dict[str, list[ModelConfig]] = {
     "metrics": [
         ModelConfig(
-            "meta-llama/Llama-3.1-8B-Instruct:scaleway", "hf_inference",
+            "gpt-oss-120b", "cerebras",
             structured_method="json_mode",
         ),
         ModelConfig(
-            "llama-3.1-8b-instant", "groq",
+            "qwen/qwen3-32b", "groq",
             structured_method="json_mode",
         ),
         ModelConfig(
-            "groq/compound", "groq",
+            "llama-3.3-70b-versatile", "groq",
             structured_method="json_mode",
         ),
     ],
     "risk": [
         ModelConfig(
-            "Qwen/Qwen2.5-72B-Instruct:featherless-ai", "hf_inference",
-            structured_method="json_mode",
-        ),
-        ModelConfig(
             "nvidia/nemotron-3-super-120b-a12b", "nvidia",
             structured_method="json_mode",
         ),
+        ModelConfig(
+            "gpt-oss-120b", "cerebras",
+            structured_method="json_mode",
+        ),
+
     ],
     "news": [
         # gemini-2.5-flash primary — Groq Llama fallback (Gemini 3.5 has thought_signature bugs)

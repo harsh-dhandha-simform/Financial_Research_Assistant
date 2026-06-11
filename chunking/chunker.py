@@ -132,6 +132,9 @@ def chunk_document(
         return [], []
 
     doc_id = document.doc_id
+    # Extract source info for chunk metadata
+    source_file_name = document.metadata.file_name or ""
+    source_company = document.metadata.company_name or ""
 
     # ── Step 1: Detect section boundaries ────────────────────────────────────
     section_boundaries = _detect_sections(text)
@@ -192,6 +195,9 @@ def chunk_document(
                     "parent_chunk_index": parent_idx,
                     "start_index_in_parent": raw_child.start_index,
                     "end_index_in_parent": raw_child.end_index,
+                    "source_document": source_file_name,
+                    "company_name": source_company,
+                    "page": parent_idx,  # approximate page from parent index
                 },
             )
             children.append(child)

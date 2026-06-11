@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analyze", tags=["analyze"])
 
 
-def _ingest_and_store(raw_doc) -> dict:
+def _ingest_and_store(raw_doc, session_id: str) -> dict:
     """Shared helper: chunk a RawDocument and store in Qdrant.
 
     Returns:
@@ -29,7 +29,9 @@ def _ingest_and_store(raw_doc) -> dict:
     """
     parents, children = chunk_document(raw_doc)
     parent_lookup = {p.chunk_id: p for p in parents}
-    store = QdrantStore()
+    
+    collection_name = f"fin_{session_id[:8]}"
+    store = QdrantStore(collection_name)
     stored = store.upsert_chunks(children, parent_lookup)
     return {
         "pages": len(raw_doc.pages),
@@ -39,9 +41,8 @@ def _ingest_and_store(raw_doc) -> dict:
     }
 
 
-def _run_pipeline(company_name: str, ticker: str, query: str) -> AnalyzeResponse:
+def _run_pipeline(company_name: str, ticker: str, query: str, session_id: str) -> AnalyzeResponse:
     """Run the full research pipeline and return API response."""
-    session_id = f"api-{company_name.lower().replace(' ', '-')}-{uuid.uuid4().hex[:6]}"
 
     if not query:
         query = f"Analyse the latest SEC filings for {company_name} ({ticker})"
@@ -102,17 +103,19 @@ async def analyze_url(
     3. Runs the multi-agent pipeline
     4. Returns InvestmentMemo + ResearchReport
     """
+    session_id = f"api-{company_name.lower().replace(' ', '-')}-{uuid.uuid4().hex[:6]}"
+    
     try:
         raw_doc = ingest_url(url=edgar_url, company_name=company_name)
-        stats = _ingest_and_store(raw_doc)
+        stats = _ingest_and_store(raw_doc, session_id)
         logger.info(
-            "Ingested URL: %d pages, %d parents, %d children, %d stored",
-            stats["pages"], stats["parents"], stats["children"], stats["chunks_stored"],
+            "Ingested URL: %d pages, %d parents, %d children, %d stored for session %s",
+            stats["pages"], stats["parents"], stats["children"], stats["chunks_stored"], session_id
         )
     except Exception as exc:
         logger.warning("URL ingestion failed (pipeline will use search): %s", exc)
 
-    return _run_pipeline(company_name, ticker, query)
+    return _run_pipeline(company_name, ticker, query, session_id)
 
 
 @router.post("/upload", response_model=AnalyzeResponse)
@@ -133,18 +136,20 @@ async def analyze_upload(
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     content = await file.read()
+    session_id = f"api-{company_name.lower().replace(' ', '-')}-{uuid.uuid4().hex[:6]}"
+
     try:
         raw_doc = ingest_pdf(
             file_bytes=content,
             file_name=file.filename,
             company_name=company_name,
         )
-        stats = _ingest_and_store(raw_doc)
+        stats = _ingest_and_store(raw_doc, session_id)
         logger.info(
-            "Ingested PDF: %d pages, %d parents, %d children, %d stored",
-            stats["pages"], stats["parents"], stats["children"], stats["chunks_stored"],
+            "Ingested PDF: %d pages, %d parents, %d children, %d stored for session %s",
+            stats["pages"], stats["parents"], stats["children"], stats["chunks_stored"], session_id
         )
     except Exception as exc:
         logger.warning("PDF ingestion failed (pipeline will use search): %s", exc)
 
-    return _run_pipeline(company_name, ticker, query)
+    return _run_pipeline(company_name, ticker, query, session_id)

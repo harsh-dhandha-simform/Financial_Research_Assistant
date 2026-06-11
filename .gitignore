@@ -8,3 +8,5 @@ __pycache__/
 .chainlit/
 /test/as.py
 /test/em.py
+/data
+.files/

@@ -7,13 +7,18 @@ Usage:
 """
 
 import os
+import sys
 from pathlib import Path
+
+# Ensure project root is in the python path
+_PROJECT_ROOT = Path(__file__).resolve().parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 # ── Load .env from project root ─────────────────────────────────────────────
-_PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(_PROJECT_ROOT / ".env")
 
 

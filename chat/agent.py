@@ -31,6 +31,7 @@ from langchain_core.documents import Document
 from agents.base import get_llm, create_langfuse_config
 from tools.retriever import rag_retriever
 from tools.chat.query_rewriter import query_rewriter
+from tools.chat.citation_builder import build_citations
 from schemas.chat import ChatResponse
 
 logger = logging.getLogger(__name__)
@@ -95,11 +96,11 @@ def _format_chat_history(messages: list) -> str:
     return "\n".join(lines)
 
 
-def _retrieve_context(query: str, section_filter: str = "", top_k: int = 6) -> tuple[str, list[str]]:
+def _retrieve_context(query: str, section_filter: str = "", top_k: int = 6, session_id: str = "") -> tuple[str, list]:
     """Retrieve relevant document chunks.
 
     Returns:
-        Tuple of (formatted context string, list of source descriptions).
+        Tuple of (formatted context string, list of Citation objects).
     """
     try:
         docs = rag_retriever.invoke({
@@ -111,8 +112,10 @@ def _retrieve_context(query: str, section_filter: str = "", top_k: int = 6) -> t
         if not docs:
             return "", []
 
+        # Build formal citations so Pydantic validation passes
+        citations = build_citations(docs, session_id)
+        
         context_parts = []
-        sources = []
         for i, doc in enumerate(docs):
             section = doc.metadata.get("section", "unknown")
             score = doc.metadata.get("score", 0)
@@ -120,9 +123,8 @@ def _retrieve_context(query: str, section_filter: str = "", top_k: int = 6) -> t
                 f"[Source {i+1} | Section: {section} | Relevance: {score:.3f}]\n"
                 f"{doc.page_content}\n"
             )
-            sources.append(f"Section: {section} (score: {score:.3f})")
 
-        return "\n---\n".join(context_parts), sources
+        return "\n---\n".join(context_parts), citations
 
     except Exception as exc:
         logger.warning("RAG retrieval failed: %s", exc)
@@ -172,7 +174,7 @@ def chat(
     logger.info("Chat query: '%s' → rewritten: '%s'", question[:60], rewritten[:60])
 
     # ── 2. RAG retrieval ─────────────────────────────────────────────
-    rag_context, sources = _retrieve_context(rewritten, section_filter, top_k)
+    rag_context, sources = _retrieve_context(rewritten, section_filter, top_k, session_id)
 
     # ── 3. Include pipeline context if available ─────────────────────
     pipeline_ctx = _pipeline_context.get(session_id, "")

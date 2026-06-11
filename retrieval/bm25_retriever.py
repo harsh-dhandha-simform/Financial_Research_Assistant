@@ -216,6 +216,7 @@ class BM25Retriever:
                     score=score,
                     sparse_score=score,
                     retrieval_method="sparse",
+                    metadata=chunk.get("metadata", {}),
                 )
             )
 

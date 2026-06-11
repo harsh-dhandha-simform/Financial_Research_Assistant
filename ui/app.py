@@ -49,7 +49,10 @@ from ui.actions.export_actions import (
     export_memo_docx, export_memo_pdf,
     export_report_docx, export_report_pdf,
 )
-from ui.components import show_welcome, show_sources_tab, show_pipeline_actions
+from ui.components import show_welcome, show_scoped_sources, show_global_sources_tab, show_pipeline_actions
+from graph.workflow import build_research_graph
+from graph.state import ResearchState
+from agents.base import create_langfuse_config
 import ui.auth  # Registers @cl.password_auth_callback
 
 logger = logging.getLogger(__name__)
@@ -172,19 +175,19 @@ def _format_error(exc: Exception) -> str:
     return msg
 
 
-# def _classify_badge(doc: dict) -> str:
-
-
-def _chunk_and_store(raw_doc) -> dict:
+def _chunk_and_store(raw_doc, collection_name: str) -> dict:
     """Chunk a RawDocument and store in Qdrant. Returns stats."""
+    if not collection_name:
+        raise ValueError("Cannot store document without a valid session collection_name")
+
     parents, children = chunk_document(raw_doc)
     parent_lookup = {p.chunk_id: p for p in parents}
-    store = QdrantStore()
+    store = QdrantStore(collection_name)
     stored = store.upsert_chunks(children, parent_lookup)
 
     # Build BM25 index from the newly ingested chunks so hybrid retrieval works
     from tools.retriever import rebuild_bm25_index
-    rebuild_bm25_index()
+    rebuild_bm25_index(collection_name)
 
     return {
         "pages": len(raw_doc.pages),
@@ -201,55 +204,51 @@ def _chunk_and_store(raw_doc) -> dict:
 
 @cl.on_chat_start
 async def on_start():
-    """Initialize or restore session — routes by active profile tab."""
+    """Initialize or restore session."""
     session_id = cl.user_session.get("id") or f"cl-{uuid.uuid4().hex[:8]}"
     cl.user_session.set("session_id", session_id)
 
+    user = cl.user_session.get("user")
+    user_identifier = user.identifier if user else "anonymous"
+
     # Get or create persistent session
-    session = session_store.get_or_create(session_id)
+    session = session_store.get_or_create(session_id, user_identifier=user_identifier)
     cl.user_session.set("session", session)
     cl.user_session.set("memo_obj", None)
     cl.user_session.set("report_obj", None)
 
-    # Since chat profiles are removed, we default to the Welcome Screen.
-    # Users navigate via Action Buttons within the same chat thread.
     await show_welcome(session)
 
-@cl.action_callback("View Sources")
-async def on_action_view_sources(action: cl.Action):
-    session = cl.user_session.get("session")
-    
-    # Hide chat input via CSS injection
-    css = "<style>#chat-input { display: none !important; }</style>"
-    await cl.Message(
-        content=f"**📂 Sources Tab**{css}",
-        actions=[cl.Action(name="Return to Chat", label="💬 Return to Chat", payload={"value": "return"})]
-    ).send()
-    
-    await show_sources_tab(session)
 
-@cl.action_callback("View Settings")
-async def on_action_view_settings(action: cl.Action):
-    session = cl.user_session.get("session")
-    
-    css = "<style>#chat-input { display: none !important; }</style>"
-    await cl.Message(
-        content=f"**⚙️ Settings Tab**{css}",
-        actions=[cl.Action(name="Return to Chat", label="💬 Return to Chat", payload={"value": "return"})]
-    ).send()
-    
-    await _show_session_info(session)
+# ── Action callbacks for Sources / Settings navigation ───────────────────
 
-@cl.action_callback("Return to Chat")
-async def on_action_return_to_chat(action: cl.Action):
-    # This restores the chat input box by overriding the previous CSS
-    css = "<style>#chat-input { display: flex !important; }</style>"
-    await cl.Message(content=f"**💬 Returned to Chat**{css}").send()
+@cl.action_callback("view_sources")
+async def on_view_sources(action):
+    """Show the Sources panel inline in the chat thread."""
+    session_id = cl.user_session.get("session_id")
+    session: UserSession = session_store.get(session_id) if session_id else None
+    
+    if session:
+        user_id = session.user_identifier or "anonymous"
+        await show_global_sources_tab(user_id)
+    else:
+        await show_global_sources_tab("anonymous")
+
+@cl.action_callback("view_settings")
+async def on_view_settings(action: cl.Action):
+    """Show the Settings/Session info panel inline in the chat thread."""
+    session_id = cl.user_session.get("session_id")
+    session = session_store.get(session_id) if session_id else None
+    if session:
+        cl.user_session.set("session", session)
+        await _show_session_info(session)
+    else:
+        await cl.Message(content="⚙️ No session active.").send()
 
 
 @cl.on_chat_resume
 async def on_resume(thread):
-    """Re-hydrate session on chat resume (Change 1)."""
+    """Re-hydrate session on chat resume."""
     session_id = cl.user_session.get("id") or ""
     session = session_store.get(session_id)
     if session:
@@ -264,10 +263,8 @@ async def on_resume(thread):
 
 @cl.on_chat_end
 async def on_end():
-    """Cleanup temp files on session end — keep Qdrant collection."""
-    session_id = cl.user_session.get("session_id")
-    if session_id:
-        session_store.cleanup(session_id)
+    """Cleanup on session end - persistent documents are kept."""
+    pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -277,7 +274,7 @@ async def on_end():
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    """Handle all incoming messages — routes through UnifiedOrchestrator."""
+    """Main message handler for slash commands, files, and chat Q&A."""
     session_id = cl.user_session.get("session_id", "")
     user_input = message.content.strip()
     session: UserSession = cl.user_session.get("session")
@@ -301,7 +298,7 @@ async def on_message(message: cl.Message):
 
     if user_input.lower().startswith("/sources"):
         if session:
-            await show_sources_tab(session)
+            await show_scoped_sources(session)
         else:
             await cl.Message(content="📂 No session active.").send()
         return
@@ -349,9 +346,10 @@ async def on_message(message: cl.Message):
 
     elif action == "open_source_panel":
         if session:
-            await show_sources_tab(session)
+            user_id = session.user_identifier or "anonymous"
+            await show_global_sources_tab(user_id)
         else:
-            await cl.Message(content="📂 No sources available.").send()
+            await show_global_sources_tab("anonymous")
 
     else:
         # Simple text response (chitchat, out_of_domain, etc.)
@@ -368,9 +366,12 @@ async def _handle_pipeline(data: dict, session_id: str, session: UserSession):
     """Run the full research pipeline with cl.Step activity feed."""
     company_name = data.get("company_name", "")
     ticker = data.get("ticker", "")
-    query = data.get("query", f"Analyse the latest SEC filings for {company_name}")
+    query = data.get("query", "")
 
     if session:
+        if company_name == query:
+            company_name = session.company_name or "your documents"
+            
         session.company_name = company_name
         session.ticker = ticker
         session.pipeline_status = "running"
@@ -385,9 +386,6 @@ async def _handle_pipeline(data: dict, session_id: str, session: UserSession):
     ).send()
 
     try:
-        from graph.workflow import build_research_graph
-        from graph.state import ResearchState
-        from agents.base import create_langfuse_config
 
         graph = build_research_graph()
         initial_state = ResearchState(
@@ -404,43 +402,48 @@ async def _handle_pipeline(data: dict, session_id: str, session: UserSession):
         state_dict = initial_state.model_dump()
 
         # Stream graph with cl.Step activity feed
-        async with cl.Step(name="🔍 Supervisor analyzing query...", type="llm") as supervisor_step:
-            pass  # Will be updated by stream
+        async with cl.Step(name="🔍 Supervisor analyzing query...", type="run") as pipeline_step:
+            async for event in graph.astream(state_dict, config=config):
+                for node_name, state_update in event.items():
+                    if node_name == "document_gate":
+                        if state_update.get("gate_rejected"):
+                            msg = state_update.get("rejection_message", "Query rejected.")
+                            await cl.Message(content=f"⚠️ {msg}").send()
+                            if session:
+                                session.pipeline_status = "error"
+                                session_store.update(session)
+                            pipeline_step.status = "failed"
+                            return
 
-        async for event in graph.astream(state_dict, config=config):
-            for node_name, state_update in event.items():
-                if node_name == "query_guardrail":
-                    rejected = state_update.get("guardrail_rejected", False)
-                    if rejected:
-                        msg = state_update.get("rejection_message", "Query rejected.")
-                        await cl.Message(content=f"⚠️ {msg}").send()
-                        if session:
-                            session.pipeline_status = "error"
-                            session_store.update(session)
-                        return
+                    elif node_name == "supervisor":
+                        decision = state_update.get("supervisor_decision")
+                        if decision:
+                            tasks = getattr(decision, "tasks", [])
+                            if not tasks and isinstance(decision, dict):
+                                tasks = decision.get("tasks", [])
+                            task_names = []
+                            for t in tasks:
+                                name = t.get("agent_name", "") if isinstance(t, dict) else getattr(t, "agent_name", "")
+                                if name:
+                                    task_names.append(f"`{name}`")
+                            await cl.Message(
+                                content=f"⚙️ Supervisor assigned: {', '.join(task_names)}. Running agents..."
+                            ).send()
+                            pipeline_step.name = "⚙️ Agents running in parallel..."
+                            await pipeline_step.update()
 
-                elif node_name == "supervisor":
-                    decision = state_update.get("supervisor_decision")
-                    if decision:
-                        tasks = getattr(decision, "tasks", [])
-                        if not tasks and isinstance(decision, dict):
-                            tasks = decision.get("tasks", [])
-                        task_names = []
-                        for t in tasks:
-                            name = t.get("agent_name", "") if isinstance(t, dict) else getattr(t, "agent_name", "")
-                            if name:
-                                task_names.append(f"`{name}`")
-                        await cl.Message(
-                            content=f"⚙️ Supervisor assigned: {', '.join(task_names)}. Running agents..."
-                        ).send()
+                    elif node_name == "run_agents":
+                        await cl.Message(content="📝 Agents complete. Synthesis combining results...").send()
+                        pipeline_step.name = "📝 Synthesizing results..."
+                        await pipeline_step.update()
 
-                elif node_name == "run_agents":
-                    await cl.Message(content="📝 Agents complete. Synthesis combining results...").send()
+                    elif node_name == "synthesis":
+                        await cl.Message(content="📋 Synthesis complete. Formatting output...").send()
+                        pipeline_step.name = "✅ Pipeline complete!"
+                        pipeline_step.status = "success"
+                        await pipeline_step.update()
 
-                elif node_name == "synthesis":
-                    await cl.Message(content="📋 Synthesis complete. Formatting output...").send()
-
-                state_dict.update(state_update)
+                    state_dict.update(state_update)
 
         state = ResearchState(**state_dict)
 
@@ -478,9 +481,10 @@ async def _handle_pipeline(data: dict, session_id: str, session: UserSession):
         await show_pipeline_actions(company_name)
 
     except Exception as exc:
+        import traceback
         err_msg = _format_error(exc)
         await cl.Message(content=f"❌ **Pipeline failed:** {err_msg}").send()
-        logger.error("Pipeline failed: %s", exc)
+        logger.error("Pipeline failed: %s\n%s", exc, traceback.format_exc())
         if session:
             session.pipeline_status = "error"
             session_store.update(session)
@@ -489,6 +493,41 @@ async def _handle_pipeline(data: dict, session_id: str, session: UserSession):
 # ═════════════════════════════════════════════════════════════════════════════
 # PDF Upload handler
 # ═════════════════════════════════════════════════════════════════════════════
+
+async def extract_company_identity(text: str) -> tuple[str, str]:
+    """Use a fast LLM to extract company name and ticker from document text."""
+    if not text or len(text.strip()) < 50:
+        return "", ""
+        
+    try:
+        from agents.base import invoke_with_fallback
+        from langchain_core.prompts import ChatPromptTemplate
+        from pydantic import BaseModel
+        
+        class CompanyIdentity(BaseModel):
+            company_name: str
+            ticker: str
+            
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Extract the primary company name and stock ticker (if any) from the provided text of a financial document. If not found, return empty strings. Respond strictly with the JSON schema."),
+            ("human", "Text:\n{text}")
+        ])
+        
+        # Run synchronously via asyncio.to_thread or just block briefly
+        import asyncio
+        loop = asyncio.get_event_loop()
+        identity = await loop.run_in_executor(None, lambda: invoke_with_fallback(
+            agent_name="metrics", # Use a fast configured model
+            prompt_chain=prompt,
+            input_data={"text": text[:3000]},
+            output_schema=CompanyIdentity,
+        ))
+        
+        return identity.company_name.strip(), identity.ticker.strip()
+    except Exception as exc:
+        logger.warning("Failed to auto-extract company name: %s", exc)
+        return "", ""
+
 
 
 async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSession):
@@ -500,7 +539,20 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
     msg = cl.Message(content=f"📄 **Processing `{filename}`...**")
     await msg.send()
 
+    if not session or not session.collection_name:
+        await cl.Message(content="❌ **Error:** No active session found to ingest documents.").send()
+        return
+
     try:
+        import shutil
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        session_docs_dir = os.path.join(project_root, "data", "documents", session_id[:8])
+        os.makedirs(session_docs_dir, exist_ok=True)
+        permanent_path = os.path.join(session_docs_dir, filename)
+        shutil.copy2(file_path, permanent_path)
+        file_path = permanent_path
+
+        from ingestion.image_extractor import extract_page_image, extract_images_from_pdf
         with open(file_path, "rb") as f:
             file_bytes = f.read()
 
@@ -510,9 +562,39 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
             company_name=company_name,
         )
 
-        await cl.Message(content=f"📄 Extracted **{len(raw_doc.pages)} pages** — chunking & storing...").send()
+        await cl.Message(content=f"📄 Extracted **{len(raw_doc.pages)} pages**...").send()
+        
+        # Try to auto-identify company name and ticker from the first page
+        if len(raw_doc.pages) > 0:
+            extracted_company, extracted_ticker = await extract_company_identity(raw_doc.pages[0].text)
+            if extracted_company:
+                company_name = extracted_company
+            if extracted_ticker and session:
+                session.ticker = extracted_ticker
+                
+        await cl.Message(content=f"🧠 Identified Company: **{company_name}** {f'({session.ticker})' if session and session.ticker else ''}. Chunking & storing...").send()
 
-        stats = _chunk_and_store(raw_doc)
+        logger.info("[Ingest PDF] Storing in collection %s for session %s", session.collection_name, session.session_id)
+        stats = _chunk_and_store(raw_doc, session.collection_name)
+        
+        # Extract all embedded images from the PDF
+        extracted_images = extract_images_from_pdf(file_path, session_id)
+        images = extracted_images if extracted_images else []
+        
+        # Extract preview of page 1
+        preview_path = extract_page_image(file_path, 1, session_id)
+        if preview_path:
+            images.append({
+                "path": preview_path,
+                "page": 1,
+                "type": "page_preview"
+            })
+
+        # Calculate relative path for portability
+        try:
+            rel_path = os.path.relpath(file_path, project_root)
+        except ValueError:
+            rel_path = file_path
 
         # Update session
         if session:
@@ -524,11 +606,17 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
                 "source_url": "",
                 "ingested_at": datetime.utcnow().isoformat(),
                 "chunk_count": stats["stored"],
-                "image_count": 0,
-                "local_path": file_path,
+                "image_count": len(images),
+                "local_path": rel_path,
+                "images": images,
             })
             session.company_name = company_name
             session_store.update(session)
+
+        actions = [
+            cl.Action(name="ask_questions", label=f"💬 Ask about {filename}", payload={"value": "chat"}),
+            cl.Action(name="run_analysis", label=f"🔍 Run Full Analysis", payload={"value": company_name}),
+        ]
 
         await cl.Message(
             content=(
@@ -538,8 +626,9 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
                 f"| Parent chunks | **{stats['parents']}** |\n"
                 f"| Child chunks | **{stats['children']}** |\n"
                 f"| Stored in Qdrant | **{stats['stored']}** |\n\n"
-                f"Now type a query like `Analyze {company_name}` to run the pipeline."
-            )
+                f"What would you like to do next?"
+            ),
+            actions=actions
         ).send()
 
     except Exception as exc:
@@ -560,13 +649,28 @@ async def _handle_url_ingestion_action(data: dict, session_id: str, session: Use
     msg = cl.Message(content=f"🔗 **Ingesting from URL...**\n`{url[:80]}`")
     await msg.send()
 
+    if not session or not session.collection_name:
+        await cl.Message(content="❌ **Error:** No active session found to ingest documents.").send()
+        return
+
     try:
         company_name = session.company_name if session else "Unknown"
         raw_doc = ingest_url(url=url, company_name=company_name)
 
-        await cl.Message(content=f"📄 Extracted **{len(raw_doc.pages)} pages** — chunking & storing...").send()
+        await cl.Message(content=f"📄 Extracted **{len(raw_doc.pages)} pages**...").send()
+        
+        # Try to auto-identify company name and ticker from the extracted text
+        if len(raw_doc.pages) > 0:
+            extracted_company, extracted_ticker = await extract_company_identity(raw_doc.pages[0].text)
+            if extracted_company:
+                company_name = extracted_company
+            if extracted_ticker and session:
+                session.ticker = extracted_ticker
+                
+        await cl.Message(content=f"🧠 Identified Company: **{company_name}** {f'({session.ticker})' if session and session.ticker else ''}. Chunking & storing...").send()
 
-        stats = _chunk_and_store(raw_doc)
+        logger.info("[Ingest URL] Storing in collection %s for session %s", session.collection_name, session.session_id)
+        stats = _chunk_and_store(raw_doc, session.collection_name)
 
         # Update session
         if session:
@@ -710,9 +814,25 @@ async def on_export_pdf(action):
 
 @cl.action_callback("ask_questions")
 async def on_ask_questions(action):
-    await cl.Message(
-        content="💬 Ask me anything about the analysis. I have full context from the pipeline."
-    ).send()
+    """Handle Ask Questions button click."""
+    await cl.Message(content="Start typing your questions in the chat!").send()
+
+
+@cl.action_callback("run_analysis")
+async def on_run_analysis(action):
+    """Handle Run Full Analysis button click."""
+    company_name = action.payload.get("value")
+    session_id = cl.user_session.get("session_id")
+    session = session_store.get(session_id) if session_id else None
+    
+    data = {
+        "company_name": company_name,
+        "ticker": "",
+        "query": f"Analyze the latest SEC filings for {company_name}"
+    }
+    
+    await cl.Message(content=f"🚀 Starting full analysis for **{company_name}**...").send()
+    await _handle_pipeline(data, session_id, session)
 
 
 @cl.action_callback("continue_session")
@@ -726,20 +846,26 @@ async def on_continue_session(action):
 
 @cl.action_callback("start_fresh")
 async def on_start_fresh(action):
-    session_id = cl.user_session.get("session_id")
-    if session_id:
-        clear_session(session_id)
-        session_store.delete(session_id)
-
-    # Create fresh session
-    new_session_id = f"cl-{uuid.uuid4().hex[:8]}"
-    cl.user_session.set("session_id", new_session_id)
-    session = session_store.get_or_create(new_session_id)
-    cl.user_session.set("session", session)
-    cl.user_session.set("memo_obj", None)
-    cl.user_session.set("report_obj", None)
-
-    await show_welcome()
+    # Emit Chainlit's native clear session event to restart the thread correctly
+    try:
+        await cl.context.emitter.emit("clear_session", {})
+    except Exception as exc:
+        logger.warning("Failed to emit clear_session: %s", exc)
+        # Fallback if emitter fails
+        session_id = cl.user_session.get("session_id")
+        if session_id:
+            clear_session(session_id)
+            session_store.delete(session_id)
+    
+        # Create fresh session
+        new_session_id = f"cl-{uuid.uuid4().hex[:8]}"
+        cl.user_session.set("session_id", new_session_id)
+        session = session_store.get_or_create(new_session_id)
+        cl.user_session.set("session", session)
+        cl.user_session.set("memo_obj", None)
+        cl.user_session.set("report_obj", None)
+    
+        await show_welcome(session)
 
 
 @cl.action_callback("remove_doc")

@@ -14,6 +14,7 @@ Usage:
 
 import logging
 import os
+from typing import Optional
 
 import fitz  # PyMuPDF
 from langfuse.decorators import observe
@@ -143,3 +144,119 @@ def extract_images_from_bytes(
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def extract_page_image(
+    pdf_path: str,
+    page_num: int,
+    session_id: str,
+    zoom_x: float = 2.0,
+    zoom_y: float = 2.0,
+) -> Optional[str]:
+    """Render a specific PDF page as an image.
+    
+    Args:
+        pdf_path: Path to the PDF file.
+        page_num: Page number (1-indexed).
+        session_id: Session ID for storing the image.
+        zoom_x, zoom_y: Zoom factors for resolution.
+        
+    Returns:
+        Path to the saved image file, or None if failed.
+    """
+    session_dir = os.path.join(IMAGES_BASE_DIR, session_id[:8])
+    os.makedirs(session_dir, exist_ok=True)
+    
+    try:
+        doc = fitz.open(pdf_path)
+        if page_num < 1 or page_num > len(doc):
+            return None
+            
+        page = doc[page_num - 1]
+        mat = fitz.Matrix(zoom_x, zoom_y)
+        pix = page.get_pixmap(matrix=mat)
+        
+        filename = f"render_page{page_num}.png"
+        save_path = os.path.join(session_dir, filename)
+        
+        pix.save(save_path)
+        doc.close()
+        return save_path
+    except Exception as exc:
+        logger.warning("Failed to render page %d of %s: %s", page_num, pdf_path, exc)
+        return None
+
+def extract_chunk_crop(
+    pdf_path: str,
+    page_num: int,
+    text_chunk: str,
+    session_id: str,
+    zoom_x: float = 2.0,
+    zoom_y: float = 2.0,
+) -> Optional[str]:
+    """Render a cropped image of the specific text region on a PDF page.
+    
+    Searches for the text on the page to find its bounding box, pads it,
+    and returns a cropped image of just that region.
+    """
+    if not text_chunk or len(text_chunk) < 10:
+        return None
+        
+    import uuid
+    session_dir = os.path.join(IMAGES_BASE_DIR, session_id[:8])
+    os.makedirs(session_dir, exist_ok=True)
+    
+    try:
+        doc = fitz.open(pdf_path)
+        if page_num < 1 or page_num > len(doc):
+            return None
+            
+        page = doc[page_num - 1]
+        
+        clean_text = text_chunk.strip()
+        lines = [line.strip() for line in clean_text.split("\n") if len(line.strip()) > 10]
+        if not lines:
+            lines = [clean_text[:50]]
+            
+        search_lines = [lines[0]]
+        if len(lines) > 1:
+            search_lines.append(lines[-1]) # last line
+        if len(lines) > 2:
+            search_lines.append(lines[len(lines)//2]) # middle line
+            
+        found_rects = []
+        for line in search_lines:
+            candidate = line[:40] # take up to 40 chars to avoid wrapping issues
+            if not candidate:
+                continue
+            r = page.search_for(candidate)
+            if r:
+                found_rects.extend(r)
+        
+        if not found_rects:
+            # Fallback to rendering the whole page if text not found
+            doc.close()
+            return extract_page_image(pdf_path, page_num, session_id, zoom_x, zoom_y)
+            
+        # Create a bounding box covering the found text, with padding
+        rect = found_rects[0]
+        for r in found_rects[1:]:
+            rect = rect | r  # Union of rectangles
+            
+        rect.x0 = max(0, rect.x0 - 30)
+        rect.y0 = max(0, rect.y0 - 30)
+        rect.x1 = min(page.rect.width, rect.x1 + 30)
+        rect.y1 = min(page.rect.height, rect.y1 + 40)
+        
+        mat = fitz.Matrix(zoom_x, zoom_y)
+        pix = page.get_pixmap(matrix=mat, clip=rect)
+        
+        filename = f"crop_p{page_num}_{uuid.uuid4().hex[:6]}.png"
+        save_path = os.path.join(session_dir, filename)
+        
+        pix.save(save_path)
+        doc.close()
+        return save_path
+    except Exception as exc:
+        logger.warning("Failed to render crop for page %d of %s: %s", page_num, pdf_path, exc)
+        return None

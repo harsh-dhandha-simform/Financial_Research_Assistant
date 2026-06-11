@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 
 CHAT_GUARDRAIL_SYSTEM = """You are a strict guardrail for a financial chat assistant.
 Your job is to determine if the user's question is relevant to financial research,
-a specific company, SEC filings, investing, or market analysis.
+a specific company, SEC filings, investing, market analysis, or ANY uploaded documents/PDFs.
 
-If the query is valid, respond with:
-{"valid": true, "reason": "valid financial question"}
+If the query is valid (including ANY questions about uploaded documents), respond with:
+{"valid": true, "reason": "valid financial or document question"}
 
 If the query is completely unrelated (e.g. coding help, writing a poem, recipes,
 or general chitchat), respond with:

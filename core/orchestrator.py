@@ -17,7 +17,6 @@ from typing import Any, Optional
 
 from core.intent_router import route_intent, UserIntent, IntentResult
 from core.domain_validator import validate_url_domain
-from tools.chat.guardrail import check_chat_guardrail
 
 logger = logging.getLogger(__name__)
 
@@ -66,17 +65,7 @@ class UnifiedOrchestrator:
             if pdf_files:
                 return await self._handle_file_upload(pdf_files[0], session_id, user_input)
                 
-        # 2. Guardrail check for pure text
-        # Fast early rejection for completely unrelated inputs
-        is_valid, rejection_msg = check_chat_guardrail(user_input, session_id)
-        if not is_valid:
-            return OrchestratorResponse(
-                content=rejection_msg,
-                intent=UserIntent.OUT_OF_DOMAIN.value,
-                success=False
-            )
-
-        # 3. Intent Routing (returns IntentResult)
+        # 2. Intent Routing (returns IntentResult)
         intent_result: IntentResult = route_intent(user_input, session_id)
         intent = intent_result.intent
         

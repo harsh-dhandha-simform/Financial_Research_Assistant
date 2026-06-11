@@ -7,19 +7,36 @@ from schemas.citation import Citation
 from langfuse.decorators import observe
 
 @observe()
-def build_citations(docs: list[Document]) -> list[Citation]:
+def build_citations(docs: list[Document], session_id: str = "") -> list[Citation]:
     """Convert retrieved LangChain Documents into rich Citation objects.
     
     Extracts metadata like page numbers, section filters, and image associations
-    that were stored in Qdrant during ingestion.
+    that were stored in Qdrant during ingestion. Generates cropped images of the
+    chunk location for PDF files.
     """
+    from ingestion.image_extractor import extract_chunk_crop
+    from sessions.session_store import session_store
+    
     citations = []
+    
+    # Pre-fetch session documents to find local paths for PDFs
+    session = session_store.get(session_id) if session_id else None
+    doc_paths = {}
+    if session:
+        for d in session.ingested_documents:
+            if d.get("type") == "pdf" and d.get("local_path"):
+                doc_paths[d.get("name")] = d.get("local_path")
     
     for doc in docs:
         metadata = doc.metadata
         
-        # Core fields
-        source_doc = metadata.get("source_document", metadata.get("source", "Unknown Document"))
+        # Core fields — try multiple metadata keys with robust fallbacks
+        source_doc = (
+            metadata.get("source_document")
+            or metadata.get("source")
+            or metadata.get("file_name")
+            or metadata.get("doc_id", "Unknown Document")
+        )
         page_num = metadata.get("page", 0)
         section = metadata.get("section", "General")
         
@@ -34,13 +51,32 @@ def build_citations(docs: list[Document]) -> list[Citation]:
         # Relevance score (if provided by HybridRetriever)
         confidence = metadata.get("score", 0.0)
         
-        # Image fields (populated by Jina ingestion / PyMuPDF)
+        # Image fields
+        image_url = None
+        image_description = None
+        image_type = None
+        
+        # First check if there's a pre-extracted image from Jina
         image_urls = metadata.get("image_urls", [])
         image_descs = metadata.get("image_descriptions", [])
-        
-        has_image = len(image_urls) > 0
-        image_url = image_urls[0] if has_image else None
-        image_description = image_descs[0] if len(image_descs) > 0 else None
+        if len(image_urls) > 0:
+            image_url = image_urls[0]
+            image_description = image_descs[0] if len(image_descs) > 0 else None
+            image_type = "other"
+            
+        # If no image but we have a local PDF path, generate a crop of the chunk
+        elif session_id and page_num > 0 and source_doc in doc_paths:
+            import os
+            local_path = doc_paths[source_doc]
+            if not os.path.isabs(local_path):
+                project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                local_path = os.path.join(project_root, local_path)
+            crop_path = extract_chunk_crop(local_path, page_num, full_text, session_id)
+            if crop_path:
+                image_url = crop_path
+                image_type = "pdf_crop"
+                
+        has_image = bool(image_url)
         
         citation = Citation(
             text=text_excerpt,
@@ -53,7 +89,7 @@ def build_citations(docs: list[Document]) -> list[Citation]:
             has_image=has_image,
             image_url=image_url,
             image_description=image_description,
-            image_type="other" if has_image else None
+            image_type=image_type
         )
         
         citations.append(citation)
