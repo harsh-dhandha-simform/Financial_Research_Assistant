@@ -546,39 +546,47 @@ async def _handle_pipeline(data: dict, session_id: str, session: UserSession):
 # PDF Upload handler
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def extract_company_identity(text: str) -> tuple[str, str]:
-    """Use a fast LLM to extract company name and ticker from document text."""
+async def classify_and_extract_document(text: str) -> dict:
+    """Use a fast LLM to classify domain and extract company name/ticker."""
     if not text or len(text.strip()) < 50:
-        return "", ""
+        return {"is_financial_domain": False, "company_name": "", "ticker": "", "document_type": "Unknown"}
         
     try:
         from agents.base import invoke_with_fallback
         from langchain_core.prompts import ChatPromptTemplate
-        from pydantic import BaseModel
+        from pydantic import BaseModel, Field
         
-        class CompanyIdentity(BaseModel):
-            company_name: str
-            ticker: str
+        class DocumentClassification(BaseModel):
+            is_financial_domain: bool = Field(description="True if the document pertains to financial or business analysis, SEC filings, corporate reports, news, or earnings.")
+            document_type: str = Field(description="Type of document (e.g., '10-K', 'Earnings Transcript', 'News Article', 'Recipe', 'Unknown')")
+            company_name: str = Field(description="Primary company name if found, else empty string")
+            ticker: str = Field(description="Stock ticker if found, else empty string")
             
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "Extract the primary company name and stock ticker (if any) from the provided text of a financial document. If not found, return empty strings. Respond strictly with the JSON schema."),
+            ("system", "Analyze the provided text. Determine if it belongs to the financial/business domain (e.g. SEC filings, annual reports, earnings transcripts, business news). If it is a recipe, fiction, or unrelated, set is_financial_domain to false. Also extract the document type, company name, and stock ticker if present. Respond strictly with the JSON schema."),
             ("human", "Text:\n{text}")
         ])
         
         # Run synchronously via asyncio.to_thread or just block briefly
         import asyncio
         loop = asyncio.get_event_loop()
-        identity = await loop.run_in_executor(None, lambda: invoke_with_fallback(
+        classification = await loop.run_in_executor(None, lambda: invoke_with_fallback(
             agent_name="metrics", # Use a fast configured model
             prompt_chain=prompt,
             input_data={"text": text[:3000]},
-            output_schema=CompanyIdentity,
+            output_schema=DocumentClassification,
         ))
         
-        return identity.company_name.strip(), identity.ticker.strip()
+        return {
+            "is_financial_domain": classification.is_financial_domain,
+            "document_type": classification.document_type,
+            "company_name": classification.company_name.strip(),
+            "ticker": classification.ticker.strip()
+        }
     except Exception as exc:
-        logger.warning("Failed to auto-extract company name: %s", exc)
-        return "", ""
+        logger.warning("Failed to classify document: %s", exc)
+        # Fail-open: if the LLM call fails, assume it's valid so we don't block the user
+        return {"is_financial_domain": True, "company_name": "", "ticker": "", "document_type": "Unknown"}
 
 
 
@@ -619,9 +627,21 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
 
         await cl.Message(content=f"📄 Extracted **{len(raw_doc.pages)} pages**...").send()
         
-        # Try to auto-identify company name and ticker from the first page
+        # Classify document domain and try to auto-identify company name and ticker
         if len(raw_doc.pages) > 0:
-            extracted_company, extracted_ticker = await extract_company_identity(raw_doc.pages[0].content)
+            preview_text = "\n".join(p.content for p in raw_doc.pages[:3] if p.content)
+            classification = await classify_and_extract_document(preview_text)
+            
+            if not classification.get("is_financial_domain", True):
+                await cl.Message(content=f"❌ **Document Rejected:** The uploaded document does not appear to be related to the financial or business domain. Please provide a valid SEC filing, annual report, or business analysis document. (Detected type: {classification.get('document_type', 'Unknown')})").send()
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+                return
+                
+            extracted_company = classification.get("company_name")
+            extracted_ticker = classification.get("ticker")
             if extracted_company:
                 company_name = extracted_company
             if extracted_ticker and session:
@@ -719,9 +739,17 @@ async def _handle_url_ingestion_action(data: dict, session_id: str, session: Use
 
         await cl.Message(content=f"📄 Extracted **{len(raw_doc.pages)} pages**...").send()
         
-        # Try to auto-identify company name and ticker from the extracted text
+        # Classify document domain and try to auto-identify company name and ticker
         if len(raw_doc.pages) > 0:
-            extracted_company, extracted_ticker = await extract_company_identity(raw_doc.pages[0].text)
+            preview_text = "\n".join(p.text for p in raw_doc.pages[:3] if p.text)
+            classification = await classify_and_extract_document(preview_text)
+            
+            if not classification.get("is_financial_domain", True):
+                await cl.Message(content=f"❌ **URL Rejected:** The content at this URL does not appear to be related to the financial or business domain. Please provide a valid SEC filing, annual report, or business analysis URL. (Detected type: {classification.get('document_type', 'Unknown')})").send()
+                return
+                
+            extracted_company = classification.get("company_name")
+            extracted_ticker = classification.get("ticker")
             if extracted_company:
                 company_name = extracted_company
             if extracted_ticker and session:
