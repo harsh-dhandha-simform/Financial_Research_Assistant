@@ -93,7 +93,7 @@ class ModelConfig:
 
     model_id: str
     provider: str        # "hf_inference", "openrouter", "groq", "cerebras", "google", "nvidia"
-    max_tokens: int = 4096
+    max_tokens: int | None = None   # None = use model's own max output limit
     temperature: float = 0.0
     timeout: int = REQUEST_TIMEOUT
     structured_method: str = "json_schema"
@@ -136,13 +136,16 @@ AGENT_MODELS: dict[str, list[ModelConfig]] = {
 
     ],
     "news": [
-        # gemini-2.5-flash primary — Groq Llama fallback (Gemini 3.5 has thought_signature bugs)
+        # gemini-2.5-flash primary — Groq Llama fallback
+        # 8192 tokens is generous for chat responses without risk of runaway output
         ModelConfig(
             "gemini-2.5-flash", "google",
+            max_tokens=8192,
             structured_method="function_calling",
         ),
         ModelConfig(
             "llama-3.3-70b-versatile", "groq",
+            max_tokens=8192,
             structured_method="json_mode",
         ),
     ],
@@ -251,14 +254,22 @@ def _create_llm(config: ModelConfig) -> ChatOpenAI:
     if not api_key:
         raise ValueError(f"No API key for provider '{config.provider}'")
 
-    return ChatOpenAI(
-        model=config.model_id,
-        openai_api_key=api_key,
-        openai_api_base=base_url,
-        temperature=config.temperature,
-        max_tokens=config.max_tokens,
-        request_timeout=config.timeout,
-    )
+    kwargs: dict = {
+        "model": config.model_id,
+        "openai_api_key": api_key,
+        "openai_api_base": base_url,
+        "temperature": config.temperature,
+        "request_timeout": config.timeout,
+    }
+    # Only pass max_tokens when explicitly set — omitting it lets the model use its own max
+    if config.max_tokens is not None:
+        kwargs["max_tokens"] = config.max_tokens
+    
+    # Disable built-in retries for Google so our manual fallback/rotation takes over instantly
+    if config.provider == "google":
+        kwargs["max_retries"] = 0
+
+    return ChatOpenAI(**kwargs)
 
 
 def _get_structured_llm(
@@ -335,6 +346,7 @@ def _resolve_tool(tool_name: str, tools: list[BaseTool]) -> BaseTool | None:
 def _execute_tool_calls(
     ai_message: AIMessage,
     tools: list[BaseTool],
+    config: dict | None = None,
 ) -> list[ToolMessage]:
     """Execute all tool calls from an AI message and return ToolMessages."""
     tool_messages = []
@@ -350,7 +362,7 @@ def _execute_tool_calls(
             logger.warning("Unknown tool called: %s", tool_name)
         else:
             try:
-                result = tool.invoke(tool_args)
+                result = tool.invoke(tool_args, config=config)
                 result_str = str(result)
                 # Truncate to prevent TPM blowout on free-tier providers
                 if len(result_str) > MAX_TOOL_OUTPUT_CHARS:
@@ -520,7 +532,7 @@ def run_tool_agent(
                         break
 
                     # Execute tool calls and feed results back
-                    tool_messages = _execute_tool_calls(response, tools)
+                    tool_messages = _execute_tool_calls(response, tools, config=config)
                     messages.extend(tool_messages)
                     tool_call_count += len(response.tool_calls)
 

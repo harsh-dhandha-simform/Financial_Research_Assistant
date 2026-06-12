@@ -122,140 +122,117 @@ async def show_pipeline_actions(company_name: str):
 
 # ── Sources tab / Document library ───────────────────────────────────────────
 
-async def show_scoped_sources(session: UserSession):
-    """Display the document library for the current session ONLY."""
-    if not session.ingested_documents:
+def _render_doc_elements(doc: dict) -> list:
+    """Build Chainlit elements (PDF viewer / URL text) for a document dict."""
+    elements = []
+    badge = classify_doc_badge(doc)
+
+    if doc.get("type") == "pdf" and doc.get("local_path"):
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        local_path = doc["local_path"]
+        if not os.path.isabs(local_path):
+            local_path = os.path.join(project_root, local_path)
+        if os.path.exists(local_path):
+            elements.append(cl.Pdf(
+                name=doc.get("name", "document.pdf"),
+                path=local_path,
+                display="inline"
+            ))
+    elif doc.get("type") == "url":
+        elements.append(cl.Text(
+            name=doc.get("name", "document"),
+            content=f"URL: {doc.get('source_url', 'N/A')}",
+            display="side"
+        ))
+    return elements
+
+
+async def show_sources_for_user(user_id: str):
+    """Display ALL documents for a user (user-scoped, across all sessions).
+
+    Queries the documents table by user_id — this is the canonical source of truth.
+    Used by both the Sources tab button and the /sources command.
+    """
+    from sessions.session_store import session_store
+    logger.debug("[SOURCES-READ] user_id=%s", user_id)
+
+    docs = session_store.get_docs_for_user(user_id)
+
+    if not docs:
         await cl.Message(
             content="📂 No documents ingested yet. Upload a PDF or paste an EDGAR URL."
         ).send()
         return
 
-    for doc in session.ingested_documents:
+    await cl.Message(
+        content=f"### 📁 Your Document Library ({len(docs)} document{'s' if len(docs) != 1 else ''})"
+    ).send()
+
+    for doc in docs:
+        elements = _render_doc_elements(doc)
         badge = classify_doc_badge(doc)
-        elements = []
-
-        # PDF preview (first page as image)
-        if doc.get("type") == "pdf" and doc.get("local_path"):
-            preview_img = next((img for img in doc.get("images", []) if img.get("type") == "page_preview"), None)
-            if preview_img and os.path.exists(preview_img.get("path", "")):
-                elements.append(cl.Image(
-                    name=f"📄 Page 1 Preview - {doc.get('name', 'document.pdf')}",
-                    path=preview_img.get("path"),
-                    display="inline"
-                ))
-            else:
-                # Fallback to rendering page 1 on the fly
-                from ingestion.image_extractor import extract_page_image
-                project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-                local_path = doc["local_path"]
-                if not os.path.isabs(local_path):
-                    local_path = os.path.join(project_root, local_path)
-                preview_path = extract_page_image(local_path, 1, session.session_id)
-                if preview_path:
-                    if "images" not in doc:
-                        doc["images"] = []
-                    # Avoid duplicates
-                    if not any(img.get("type") == "page_preview" for img in doc["images"]):
-                        doc["images"].append({
-                            "path": preview_path,
-                            "page": 1,
-                            "type": "page_preview"
-                        })
-                    elements.append(cl.Image(
-                        name=f"📄 Page 1 Preview - {doc.get('name', 'document.pdf')}",
-                        path=preview_path,
-                        display="inline"
-                    ))
-        elif doc.get("type") == "url":
-            elements.append(cl.Text(
-                name=doc.get("name", "document"),
-                content=f"URL: {doc.get('source_url', 'N/A')}",
-                display="side"
-            ))
-
-        # Extracted images (excluding page preview)
-        for img in doc.get("images", []):
-            if img.get("type") == "page_preview":
-                continue
-            elements.append(cl.Image(
-                name=f"Page {img.get('page', '?')}",
-                path=img.get("path", ""),
-                display="inline"
-            ))
+        ingested_at = doc.get("ingested_at", "")[:19].replace("T", " ") if doc.get("ingested_at") else "N/A"
 
         await cl.Message(
             content=(
                 f"**{doc.get('name', 'Unknown')}** {badge}\n"
                 f"Chunks: {doc.get('chunk_count', 0)} | "
                 f"Images: {doc.get('image_count', 0)} | "
-                f"Ingested: {doc.get('ingested_at', 'N/A')}"
+                f"Ingested: {ingested_at}"
             ),
             elements=elements,
             actions=[
                 cl.Action(
                     name="remove_doc",
                     label="🗑 Remove",
-                    payload={"doc_id": doc.get("doc_id", "")}
+                    payload={"doc_id": doc.get("doc_id", ""), "user_id": user_id}
                 )
             ]
         ).send()
 
 
+# Backward-compat aliases — both now delegate to show_sources_for_user
+async def show_scoped_sources(session: "UserSession"):
+    """Show sources for the user associated with this session."""
+    user_id = getattr(session, "user_identifier", "") or "anonymous"
+    await show_sources_for_user(user_id)
+
 
 async def show_global_sources_tab(user_identifier: str):
-    """Display all documents ingested across all sessions for a user."""
-    from sessions.session_store import session_store
-    all_sessions = session_store.get_all_by_user(user_identifier)
-    
-    if not all_sessions:
-        await cl.Message(
-            content="📂 No documents ingested yet across any sessions."
-        ).send()
-        return
+    """Show all sources for a user (tab click or /sources command)."""
+    await show_sources_for_user(user_identifier)
 
-    has_docs = any(s.has_documents for s in all_sessions)
-    if not has_docs:
-        await cl.Message(
-            content="📂 No documents ingested yet across any sessions."
-        ).send()
-        return
-        
-    for sess in all_sessions:
-        if not sess.has_documents:
-            continue
-            
-        # Session header
-        date_str = sess.created_at.strftime("%Y-%m-%d %H:%M")
-        company = sess.company_name or "Unknown Company"
-        await cl.Message(
-            content=f"### 🗂️ Session: {sess.session_id[:8]} ({company}) - {date_str}"
-        ).send()
-        
-        # We can reuse the rendering logic from scoped sources
-        await show_scoped_sources(sess)
+
 # ── Welcome message ──────────────────────────────────────────────────────────
 
 async def show_welcome(session: Optional[UserSession] = None):
     """Show the welcome message for a new or returning session."""
-    # Common navigation actions available in all welcome states
     nav_actions = [
         cl.Action(name="view_sources",  label="📂 View Sources",  payload={"value": "sources"}),
         cl.Action(name="view_settings", label="⚙️ View Settings", payload={"value": "settings"}),
     ]
 
-    if session and session.has_documents:
-        # Returning user with existing data
-        doc_list = "\n".join(
-            f"  • {d.get('name', '?')}" for d in session.ingested_documents
-        )
+    # Check if user has any documents in the documents table
+    user_id = getattr(session, "user_identifier", "") if session else ""
+    docs = []
+    if user_id:
+        from sessions.session_store import session_store
+        docs = session_store.get_docs_for_user(user_id)
+
+    if session and docs:
+        # Returning user with existing documents
+        doc_list = "\n".join(f"  • {d.get('name', '?')}" for d in docs[:5])
+        if len(docs) > 5:
+            doc_list += f"\n  _...and {len(docs) - 5} more_"
+        total_chunks = sum(d.get("chunk_count", 0) for d in docs)
         await cl.Message(
             content=(
-                f"Welcome back! You have a previous analysis for **{session.company_name or 'your documents'}**.\n\n"
+                f"Welcome back! You have **{len(docs)} document{'s' if len(docs) != 1 else ''}** ready for analysis.\n\n"
                 f"**Session:** `{session.session_id[:8]}` | "
-                f"**Docs:** {len(session.ingested_documents)} | "
-                f"**Chunks:** {session.total_chunks}\n\n"
+                f"**Docs:** {len(docs)} | "
+                f"**Chunks:** {total_chunks}\n\n"
                 f"**📄 Documents:**\n{doc_list}\n\n"
-                f"Would you like to continue with it or start fresh?"
+                f"Would you like to continue or start fresh?"
             ),
             actions=[
                 cl.Action(name="continue_session", label="▶ Continue Session", payload={"value": "continue"}),
@@ -263,7 +240,6 @@ async def show_welcome(session: Optional[UserSession] = None):
             ] + nav_actions
         ).send()
     else:
-        # New session — show session ID context
         session_id_short = session.session_id[:8] if session else "new"
         await cl.Message(
             content=(
@@ -278,4 +254,3 @@ async def show_welcome(session: Optional[UserSession] = None):
             ),
             actions=nav_actions
         ).send()
-

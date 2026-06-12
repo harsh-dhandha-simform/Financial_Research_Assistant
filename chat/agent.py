@@ -96,18 +96,21 @@ def _format_chat_history(messages: list) -> str:
     return "\n".join(lines)
 
 
-def _retrieve_context(query: str, section_filter: str = "", top_k: int = 6, session_id: str = "") -> tuple[str, list]:
+def _retrieve_context(query: str, section_filter: str = "", top_k: int = 6, session_id: str = "", user_id: str = "") -> tuple[str, list]:
     """Retrieve relevant document chunks.
 
     Returns:
         Tuple of (formatted context string, list of Citation objects).
     """
     try:
-        docs = rag_retriever.invoke({
-            "query": query,
-            "section_filter": section_filter,
-            "top_k": top_k,
-        })
+        docs = rag_retriever.invoke(
+            {
+                "query": query,
+                "section_filter": section_filter,
+                "top_k": top_k,
+            },
+            config={"configurable": {"session_id": session_id, "user_id": user_id}},
+        )
 
         if not docs:
             return "", []
@@ -136,6 +139,7 @@ def chat(
     session_id: str = "",
     section_filter: str = "",
     top_k: int = 6,
+    user_id: str = "",
 ) -> ChatResponse:
     """Process a chat question with RAG retrieval and conversation memory.
 
@@ -174,7 +178,7 @@ def chat(
     logger.info("Chat query: '%s' → rewritten: '%s'", question[:60], rewritten[:60])
 
     # ── 2. RAG retrieval ─────────────────────────────────────────────
-    rag_context, sources = _retrieve_context(rewritten, section_filter, top_k, session_id)
+    rag_context, sources = _retrieve_context(rewritten, section_filter, top_k, session_id, user_id)
 
     # ── 3. Include pipeline context if available ─────────────────────
     pipeline_ctx = _pipeline_context.get(session_id, "")
@@ -187,7 +191,6 @@ def chat(
     relevant = bool(rag_context or pipeline_ctx)
 
     # ── 4. Generate answer ───────────────────────────────────────────
-    llm = get_llm("news")  # Fast model for chat
 
     messages = [
         SystemMessage(content=CHAT_SYSTEM_PROMPT),
@@ -213,20 +216,35 @@ def chat(
 
     messages.append(HumanMessage(content=user_msg))
 
+    from config import settings
+    from agents.base import _is_rate_limit_error, _rotate_google_key
+
     config = create_langfuse_config(
         session_id=session_id,
         trace_name="chat-agent",
     )
 
-    try:
-        response = llm.invoke(messages, config=config)
-        answer = response.content
-    except Exception as exc:
-        logger.error("Chat LLM failed: %s", exc)
-        answer = (
-            "I'm sorry, I encountered an error while generating a response. "
-            "Please try again or rephrase your question."
-        )
+    max_attempts = len(settings.google_api_keys) if settings.google_api_keys else 1
+    answer = ""
+
+    for attempt in range(max_attempts):
+        llm = get_llm("news")  # Re-fetch LLM to get updated API key if rotated
+        try:
+            response = llm.invoke(messages, config=config)
+            answer = response.content
+            break
+        except Exception as exc:
+            if _is_rate_limit_error(exc) and attempt < max_attempts - 1:
+                logger.warning("Chat agent rate limit (429) on attempt %d. Rotating Google API key...", attempt + 1)
+                _rotate_google_key()
+                continue
+
+            logger.error("Chat LLM failed: %s", exc)
+            answer = (
+                "I'm sorry, I encountered an error while generating a response. "
+                "Please try again or rephrase your question."
+            )
+            break
 
     # ── 5. Update session history ────────────────────────────────────
     history.append(HumanMessage(content=question))

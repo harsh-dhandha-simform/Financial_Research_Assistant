@@ -118,12 +118,16 @@ async def starters():
 
 async def _show_session_info(session: UserSession):
     """Display session info panel (sidebar equivalent)."""
+    user_id = session.user_identifier or "anonymous"
+    docs = session_store.get_docs_for_user(user_id)
+
     doc_lines = []
-    for doc in session.ingested_documents:
+    for doc in docs:
         badge = _classify_badge(doc)
         doc_lines.append(f"  • {doc.get('name', 'Unknown')} {badge}")
 
     doc_section = "\n".join(doc_lines) if doc_lines else "  _(none)_"
+    total_chunks = sum(d.get("chunk_count", 0) for d in docs)
 
     status_emoji = {
         "idle": "⚪", "running": "🟡", "done": "🟢", "error": "🔴"
@@ -137,9 +141,9 @@ async def _show_session_info(session: UserSession):
             f"**Status:** {status_emoji} {session.pipeline_status}\n"
             f"**Company:** {session.company_name or '_(not set)_'}\n\n"
             f"---\n"
-            f"**📄 Ingested Documents:**\n{doc_section}\n\n"
+            f"**📄 Ingested Documents ({len(docs)} across all sessions):**\n{doc_section}\n\n"
             f"---\n"
-            f"**Memory:** {session.total_chunks} chunks | {session.total_images} images\n"
+            f"**Memory:** {total_chunks} chunks\n"
             f"**Chat history:** {len(session.chat_history)} messages"
         ),
         actions=[
@@ -175,15 +179,19 @@ def _format_error(exc: Exception) -> str:
     return msg
 
 
-def _chunk_and_store(raw_doc, collection_name: str) -> dict:
+def _chunk_and_store(raw_doc, collection_name: str, doc_id: str = "", user_id: str = "") -> dict:
     """Chunk a RawDocument and store in Qdrant. Returns stats."""
     if not collection_name:
-        raise ValueError("Cannot store document without a valid session collection_name")
+        raise ValueError("Cannot store document without a valid collection_name")
 
     parents, children = chunk_document(raw_doc)
     parent_lookup = {p.chunk_id: p for p in parents}
     store = QdrantStore(collection_name)
     stored = store.upsert_chunks(children, parent_lookup)
+
+    # Update collection chunk count in user_collections table
+    if user_id:
+        session_store.update_collection_chunk_count(user_id, stored)
 
     # Build BM25 index from the newly ingested chunks so hybrid retrieval works
     from tools.retriever import rebuild_bm25_index
@@ -204,18 +212,47 @@ def _chunk_and_store(raw_doc, collection_name: str) -> dict:
 
 @cl.on_chat_start
 async def on_start():
-    """Initialize or restore session."""
-    session_id = cl.user_session.get("id") or f"cl-{uuid.uuid4().hex[:8]}"
-    cl.user_session.set("session_id", session_id)
+    """Initialize or restore session using the Chainlit thread_id as the canonical session_id."""
+    # Lazy collection cleanup (24h rule) — runs quickly, no-op if nothing to clean
+    try:
+        session_store.check_and_cleanup_empty_collections()
+    except Exception:
+        pass
+
+    # Use the actual Chainlit thread_id, NOT a generated UUID
+    thread_id_raw = cl.context.session.thread_id or cl.user_session.get("id")
+    if isinstance(thread_id_raw, dict):
+        thread_id = thread_id_raw.get("id") or thread_id_raw.get("session_id")
+    else:
+        thread_id = thread_id_raw
+        
+    # Extra safety check to ensure thread_id is a string and not excessively long
+    if not isinstance(thread_id, str) or len(thread_id) > 50:
+        logger.warning("Invalid thread_id extracted (%s), falling back to generated UUID", type(thread_id))
+        thread_id = f"cl-{uuid.uuid4().hex[:8]}"
+        
+    if not thread_id:
+        thread_id = f"cl-{uuid.uuid4().hex[:8]}"
+        
+    cl.user_session.set("session_id", thread_id)
 
     user = cl.user_session.get("user")
-    user_identifier = user.identifier if user else "anonymous"
+    user_id = user.identifier if user else "anonymous"
 
-    # Get or create persistent session
-    session = session_store.get_or_create(session_id, user_identifier=user_identifier)
-    cl.user_session.set("session", session)
-    cl.user_session.set("memo_obj", None)
-    cl.user_session.set("report_obj", None)
+    # Check if this thread already has a session (e.g. page refresh on same thread)
+    session = session_store.get_by_thread(thread_id, user_id)
+    if session:
+        # Existing thread — re-hydrate, do NOT create new collection
+        cl.user_session.set("session", session)
+        cl.user_session.set("memo_obj", None)
+        cl.user_session.set("report_obj", None)
+        logger.info("Loaded existing session %s for user %s", thread_id[:8], user_id)
+    else:
+        # Genuinely new thread
+        session = session_store.create_new(thread_id, user_id)
+        cl.user_session.set("session", session)
+        cl.user_session.set("memo_obj", None)
+        cl.user_session.set("report_obj", None)
 
     await show_welcome(session)
 
@@ -248,17 +285,29 @@ async def on_view_settings(action: cl.Action):
 
 @cl.on_chat_resume
 async def on_resume(thread):
-    """Re-hydrate session on chat resume."""
-    session_id = cl.user_session.get("id") or ""
-    session = session_store.get(session_id)
+    """Re-hydrate session when user navigates back to an existing thread.
+
+    NEVER creates a new session or a new collection here.
+    """
+    thread_id = thread.id if hasattr(thread, "id") else str(thread)
+    cl.user_session.set("session_id", thread_id)
+
+    user = cl.user_session.get("user")
+    user_id = user.identifier if user else "anonymous"
+
+    session = session_store.get_by_thread(thread_id, user_id)
     if session:
-        cl.user_session.set("session_id", session_id)
         cl.user_session.set("session", session)
-        await cl.Message(
-            content=f"▶ Session restored for **{session.company_name or 'your documents'}**."
-        ).send()
+        cl.user_session.set("memo_obj", None)
+        cl.user_session.set("report_obj", None)
+        logger.info("Resumed session %s for user %s", thread_id[:8], user_id)
     else:
-        await on_start()
+        # Thread exists in Chainlit but not in our session DB — create it
+        session = session_store.create_new(thread_id, user_id)
+        cl.user_session.set("session", session)
+        cl.user_session.set("memo_obj", None)
+        cl.user_session.set("report_obj", None)
+        logger.info("Re-created session record for thread %s user %s", thread_id[:8], user_id)
 
 
 @cl.on_chat_end
@@ -297,10 +346,13 @@ async def on_message(message: cl.Message):
         return
 
     if user_input.lower().startswith("/sources"):
-        if session:
-            await show_scoped_sources(session)
-        else:
-            await cl.Message(content="📂 No session active.").send()
+        session = cl.user_session.get("session")
+        user_id = session.user_identifier if session else "anonymous"
+        await show_global_sources_tab(user_id)
+        return
+
+    if user_input.lower().startswith("/delete"):
+        await _handle_delete_command(session_id)
         return
 
     if user_input.lower().startswith("/session"):
@@ -539,9 +591,12 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
     msg = cl.Message(content=f"📄 **Processing `{filename}`...**")
     await msg.send()
 
-    if not session or not session.collection_name:
+    if not session:
         await cl.Message(content="❌ **Error:** No active session found to ingest documents.").send()
         return
+
+    user_id = session.user_identifier or "anonymous"
+    collection_name = session_store.get_user_collection(user_id)
 
     try:
         import shutil
@@ -566,7 +621,7 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
         
         # Try to auto-identify company name and ticker from the first page
         if len(raw_doc.pages) > 0:
-            extracted_company, extracted_ticker = await extract_company_identity(raw_doc.pages[0].text)
+            extracted_company, extracted_ticker = await extract_company_identity(raw_doc.pages[0].content)
             if extracted_company:
                 company_name = extracted_company
             if extracted_ticker and session:
@@ -574,8 +629,8 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
                 
         await cl.Message(content=f"🧠 Identified Company: **{company_name}** {f'({session.ticker})' if session and session.ticker else ''}. Chunking & storing...").send()
 
-        logger.info("[Ingest PDF] Storing in collection %s for session %s", session.collection_name, session.session_id)
-        stats = _chunk_and_store(raw_doc, session.collection_name)
+        logger.info("[Ingest PDF] Storing in collection %s for user %s", collection_name, user_id)
+        stats = _chunk_and_store(raw_doc, collection_name, user_id=user_id)
         
         # Extract all embedded images from the PDF
         extracted_images = extract_images_from_pdf(file_path, session_id)
@@ -596,20 +651,22 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
         except ValueError:
             rel_path = file_path
 
-        # Update session
+        # Store document metadata in the user-scoped documents table
+        doc_id = uuid.uuid4().hex[:8]
+        from datetime import datetime
+        doc_meta = {
+            "doc_id": doc_id,
+            "name": filename,
+            "type": "pdf",
+            "source_url": "",
+            "local_path": rel_path,
+            "chunk_count": stats["stored"],
+            "image_count": len(images),
+            "images": images,
+            "ingested_at": datetime.utcnow().isoformat(),
+        }
+        session_store.add_document(doc_meta, user_id=user_id, session_id=session.session_id)
         if session:
-            from datetime import datetime
-            session.add_document({
-                "doc_id": uuid.uuid4().hex[:8],
-                "name": filename,
-                "type": "pdf",
-                "source_url": "",
-                "ingested_at": datetime.utcnow().isoformat(),
-                "chunk_count": stats["stored"],
-                "image_count": len(images),
-                "local_path": rel_path,
-                "images": images,
-            })
             session.company_name = company_name
             session_store.update(session)
 
@@ -649,9 +706,12 @@ async def _handle_url_ingestion_action(data: dict, session_id: str, session: Use
     msg = cl.Message(content=f"🔗 **Ingesting from URL...**\n`{url[:80]}`")
     await msg.send()
 
-    if not session or not session.collection_name:
+    if not session:
         await cl.Message(content="❌ **Error:** No active session found to ingest documents.").send()
         return
+
+    user_id = session.user_identifier or "anonymous"
+    collection_name = session_store.get_user_collection(user_id)
 
     try:
         company_name = session.company_name if session else "Unknown"
@@ -669,21 +729,24 @@ async def _handle_url_ingestion_action(data: dict, session_id: str, session: Use
                 
         await cl.Message(content=f"🧠 Identified Company: **{company_name}** {f'({session.ticker})' if session and session.ticker else ''}. Chunking & storing...").send()
 
-        logger.info("[Ingest URL] Storing in collection %s for session %s", session.collection_name, session.session_id)
-        stats = _chunk_and_store(raw_doc, session.collection_name)
+        logger.info("[Ingest URL] Storing in collection %s for user %s", collection_name, user_id)
+        stats = _chunk_and_store(raw_doc, collection_name, user_id=user_id)
 
-        # Update session
+        # Store document metadata in the user-scoped documents table
+        from datetime import datetime
+        doc_meta = {
+            "doc_id": uuid.uuid4().hex[:8],
+            "name": url.split("/")[-1][:50] or "web_document",
+            "type": "url",
+            "source_url": url,
+            "local_path": "",
+            "chunk_count": stats["stored"],
+            "image_count": 0,
+            "images": [],
+            "ingested_at": datetime.utcnow().isoformat(),
+        }
+        session_store.add_document(doc_meta, user_id=user_id, session_id=session.session_id)
         if session:
-            from datetime import datetime
-            session.add_document({
-                "doc_id": uuid.uuid4().hex[:8],
-                "name": url.split("/")[-1][:50] or "web_document",
-                "type": "url",
-                "source_url": url,
-                "ingested_at": datetime.utcnow().isoformat(),
-                "chunk_count": stats["stored"],
-                "image_count": 0,
-            })
             session_store.update(session)
 
         await cl.Message(
@@ -704,6 +767,44 @@ async def _handle_url_ingestion_action(data: dict, session_id: str, session: Use
         logger.error("URL ingestion failed: %s", exc)
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# /delete command handler
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+async def _handle_delete_command(session_id: str):
+    """Handle the /delete slash command — list docs with delete action buttons."""
+    session: UserSession = cl.user_session.get("session")
+    user_id = session.user_identifier if session else "anonymous"
+
+    docs = session_store.get_docs_for_user(user_id)
+    if not docs:
+        await cl.Message(content="📂 You have no ingested documents to delete.").send()
+        return
+
+    from datetime import datetime as _dt
+    actions = []
+    lines = [f"### 🗑️ Select a document to delete ({len(docs)} total)\n"]
+    for i, doc in enumerate(docs, 1):
+        ingested_at = doc.get("ingested_at", "")[:10] if doc.get("ingested_at") else "?"
+        badge = _classify_badge(doc)
+        lines.append(
+            f"**{i}.** {doc.get('name', 'Unknown')} {badge} "
+            f"({doc.get('chunk_count', 0)} chunks) — ingested {ingested_at}"
+        )
+        actions.append(cl.Action(
+            name="remove_doc",
+            label=f"🗑 Delete [{i}]",
+            payload={"doc_id": doc["doc_id"], "user_id": user_id}
+        ))
+
+    await cl.Message(
+        content="\n".join(lines),
+        actions=actions
+    ).send()
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Chat Q&A handler
 # ═════════════════════════════════════════════════════════════════════════════
@@ -715,9 +816,12 @@ async def _handle_chat(question: str, session_id: str):
     await msg.send()
 
     try:
+        _session: UserSession = cl.user_session.get("session")
+        _user_id = _session.user_identifier if _session else ""
         response = chat(
             question=question,
             session_id=session_id,
+            user_id=_user_id,
         )
 
         answer = response.answer
@@ -870,15 +974,87 @@ async def on_start_fresh(action):
 
 @cl.action_callback("remove_doc")
 async def on_remove_doc(action):
+    """Delete a document from the documents table and remove its Qdrant points."""
     doc_id = action.payload.get("doc_id", "") if action.payload else ""
-    session: UserSession = cl.user_session.get("session")
-    if session and doc_id:
-        removed = session.remove_document(doc_id)
-        if removed:
-            session_store.update(session)
-            await cl.Message(content=f"🗑️ Document removed.").send()
-        else:
-            await cl.Message(content="⚠️ Document not found.").send()
+    user_id = action.payload.get("user_id", "") if action.payload else ""
+
+    # Fallback: get user_id from current session if not in payload
+    if not user_id:
+        session: UserSession = cl.user_session.get("session")
+        user_id = session.user_identifier if session else "anonymous"
+
+    if not doc_id:
+        await cl.Message(content="⚠️ No document ID provided.").send()
+        return
+
+    # Soft-delete from Postgres and get metadata for Qdrant cleanup
+    result = session_store.delete_document(doc_id, user_id)
+    if not result:
+        await cl.Message(
+            content="⚠️ Document not found or you don't have permission to delete it."
+        ).send()
+        return
+
+    # Delete Qdrant points belonging to this document
+    collection_name = result["collection_name"]
+    deleted_count = 0
+    try:
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        client = QdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key or None,
+        )
+        existing = [c.name for c in client.get_collections().collections]
+        if collection_name in existing:
+            # Scroll to find all point IDs for this doc_id
+            offset = None
+            point_ids = []
+            while True:
+                scroll_result = client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=Filter(
+                        must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+                    ),
+                    limit=250,
+                    offset=offset,
+                    with_payload=False,
+                )
+                points, next_offset = scroll_result
+                point_ids.extend(p.id for p in points)
+                if next_offset is None:
+                    break
+                offset = next_offset
+
+            if point_ids:
+                from qdrant_client.models import PointIdsList
+                client.delete(
+                    collection_name=collection_name,
+                    points_selector=PointIdsList(points=point_ids)
+                )
+                deleted_count = len(point_ids)
+                logger.info(
+                    "Deleted %d Qdrant points for doc %s from collection %s",
+                    deleted_count, doc_id, collection_name
+                )
+    except Exception as exc:
+        logger.warning("Qdrant cleanup failed for doc %s: %s", doc_id, exc)
+
+    await cl.Message(
+        content=f"✅ Document deleted. {deleted_count} chunk{'s' if deleted_count != 1 else ''} removed from the vector store."
+    ).send()
+
+
+@cl.action_callback("confirm_delete_doc")
+async def on_confirm_delete_doc(action):
+    """Handle the confirm button from /delete flow — delegates to remove_doc logic."""
+    await on_remove_doc(action)
+
+
+@cl.action_callback("cancel_delete")
+async def on_cancel_delete(action):
+    await cl.Message(content="❌ Deletion cancelled.").send()
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════

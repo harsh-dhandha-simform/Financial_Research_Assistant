@@ -16,16 +16,21 @@ def build_citations(docs: list[Document], session_id: str = "") -> list[Citation
     """
     from ingestion.image_extractor import extract_chunk_crop
     from sessions.session_store import session_store
-    
+
     citations = []
-    
-    # Pre-fetch session documents to find local paths for PDFs
-    session = session_store.get(session_id) if session_id else None
+
+    # Pre-fetch user's documents to find local paths for PDFs
+    # Use user_id to find docs (user-scoped, not session-scoped)
     doc_paths = {}
-    if session:
-        for d in session.ingested_documents:
-            if d.get("type") == "pdf" and d.get("local_path"):
-                doc_paths[d.get("name")] = d.get("local_path")
+    if session_id:
+        # session_id is actually the thread_id; look up the session to get user_id
+        session = session_store.get(session_id)
+        user_id = session.user_identifier if session else ""
+        if user_id:
+            user_docs = session_store.get_docs_for_user(user_id)
+            for d in user_docs:
+                if d.get("type") == "pdf" and d.get("local_path"):
+                    doc_paths[d.get("name")] = d.get("local_path")
     
     for doc in docs:
         metadata = doc.metadata
@@ -65,9 +70,10 @@ def build_citations(docs: list[Document], session_id: str = "") -> list[Citation
             image_type = "other"
             
         # If no image but we have a local PDF path, generate a crop of the chunk
-        elif session_id and page_num > 0 and source_doc in doc_paths:
+        elif session_id and page_num > 0 and source_doc and source_doc.lower() in {k.lower(): v for k, v in doc_paths.items()}:
             import os
-            local_path = doc_paths[source_doc]
+            # Use case-insensitive lookup
+            local_path = next(v for k, v in doc_paths.items() if k.lower() == source_doc.lower())
             if not os.path.isabs(local_path):
                 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
                 local_path = os.path.join(project_root, local_path)

@@ -96,15 +96,33 @@ def rag_retriever(
     Returns:
         List of LangChain Document objects with metadata (page, section, company, year).
     """
-    session_id = config.get("configurable", {}).get("session_id", "") if config else ""
-    if not session_id:
-        logger.warning("rag_retriever called without session_id in config. This may cause isolation issues.")
-        # Fallback to a global/error state if no session (should never happen in prod)
-        collection_name = "financial_chunks" 
-    else:
-        collection_name = f"fin_{session_id[:8]}"
+    configurable = config.get("configurable", {}) if config else {}
+    session_id = configurable.get("session_id", "")
+    user_id = configurable.get("user_id", "")
 
-    logger.info("[Read] rag_retriever reading from collection '%s' for session '%s'", collection_name, session_id)
+    # Determine the user's collection name
+    # Priority: user_id → session lookup → fallback
+    if user_id:
+        collection_name = f"fin_{user_id}"
+    elif session_id:
+        # Look up the session to find the user's collection
+        try:
+            from sessions.session_store import session_store
+            session = session_store.get(session_id)
+            if session and session.user_identifier:
+                collection_name = session_store.get_user_collection(session.user_identifier)
+            elif session and session.collection_name:
+                collection_name = session.collection_name
+            else:
+                logger.warning("rag_retriever: session %s has no user_id, using collection_name field", session_id[:8])
+                collection_name = f"fin_{session_id[:8]}"
+        except Exception:
+            collection_name = f"fin_{session_id[:8]}"
+    else:
+        logger.warning("rag_retriever called without session_id or user_id. This may cause isolation issues.")
+        collection_name = "financial_chunks"
+
+    logger.info("[Read] rag_retriever reading from collection '%s' for session '%s'", collection_name, session_id or user_id)
     hybrid = _get_hybrid(collection_name)
 
     # Map section names to our internal filter values
