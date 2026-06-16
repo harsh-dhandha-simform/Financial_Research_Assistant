@@ -139,3 +139,101 @@ class Settings(BaseModel):
 
 # ── Singleton — import this everywhere ───────────────────────────────────────
 settings = Settings.from_env()
+
+# ── Logging Setup ─────────────────────────────────────────────────────────────
+import logging
+import logging.handlers
+import os
+import sys
+from datetime import datetime as _dt
+
+
+def _setup_logging(process_name: str = "app") -> None:
+    """Configure production-grade logging for a named process.
+
+    Creates:
+        logs/<process_name>_YYYY-MM-DD_HH-MM-SS.log  — timestamped session log
+        logs/<process_name>_latest.log                — symlink → latest session
+
+    Third-party loggers are silenced to WARNING so our own INFO logs
+    stay readable without being buried in httpx/watchfiles/sqlalchemy noise.
+    """
+    log_dir = _PROJECT_ROOT / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    timestamp = _dt.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = log_dir / f"{process_name}_{timestamp}.log"
+    latest_link = log_dir / f"{process_name}_latest.log"
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)  # Capture everything; handlers filter
+
+    # Avoid duplicate handlers if imported multiple times
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s - %(levelname)-8s - %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # ── Console handler: INFO+ from our code, WARNING+ from libraries ─────────
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(fmt)
+    root_logger.addHandler(console)
+
+    # ── File handler: DEBUG+ everything goes to file ───────────────────────────
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=25 * 1024 * 1024,  # 25 MB per file
+        backupCount=10,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
+    root_logger.addHandler(file_handler)
+
+    # ── Symlink: logs/<process>_latest.log → current session file ─────────────
+    try:
+        if latest_link.is_symlink() or latest_link.exists():
+            latest_link.unlink()
+        latest_link.symlink_to(log_file.name)
+    except Exception:
+        pass  # Non-critical — Windows or permission issue
+
+    # ── Silence noisy third-party loggers (keep WARNING+ only) ────────────────
+    _NOISY_LOGGERS = [
+        "httpx", "httpcore", "watchfiles", "watchgod",
+        "sqlalchemy", "sqlalchemy.engine", "sqlalchemy.pool",
+        "asyncio", "urllib3", "filelock", "PIL",
+        "langfuse", "openai", "anthropic",
+        "chainlit.server", "chainlit.socket", "uvicorn.access",
+    ]
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    # Log startup banner to file
+    startup_logger = logging.getLogger("startup")
+    startup_logger.info("=" * 70)
+    startup_logger.info("Process : %s", process_name)
+    startup_logger.info("Log file: %s", log_file)
+    startup_logger.info("Started : %s", _dt.now().isoformat())
+    startup_logger.info("Python  : %s", sys.version.split()[0])
+    startup_logger.info("=" * 70)
+
+
+def _detect_process_name() -> str:
+    """Detect whether we are running under chainlit, uvicorn, or plain python."""
+    cmd = " ".join(sys.argv).lower()
+    if "chainlit" in cmd:
+        return "chainlit"
+    if "uvicorn" in cmd or "api" in cmd:
+        return "api"
+    if "pytest" in cmd or "test" in cmd:
+        return "test"
+    return "app"
+
+
+_setup_logging(_detect_process_name())
+

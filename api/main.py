@@ -32,10 +32,6 @@ from api.routers import analyze, ingest, export, agents, chat
 from config import settings
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s [%(levelname)s] %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 

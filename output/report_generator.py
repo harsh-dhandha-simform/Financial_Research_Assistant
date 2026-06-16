@@ -39,11 +39,10 @@ logger = logging.getLogger(__name__)
 
 
 def _format_key_metrics(metrics: MetricsOutput | None) -> str:
-    """Format metrics into bullet points for the memo."""
+    """Format metrics into a markdown table for the memo."""
     if metrics is None:
         return "• Financial metrics not available (agent did not run or data unavailable)"
 
-    lines = []
     metric_fields = [
         ("revenue", "Revenue"),
         ("net_income", "Net Income"),
@@ -54,18 +53,52 @@ def _format_key_metrics(metrics: MetricsOutput | None) -> str:
         ("debt_to_equity", "Debt-to-Equity"),
         ("free_cash_flow", "Free Cash Flow"),
         ("roe", "Return on Equity"),
+        ("total_assets", "Total Assets"),
+        ("total_debt", "Total Debt"),
+        ("cash_and_equivalents", "Cash & Equivalents"),
     ]
 
+    rows = []
     for field_name, display_name in metric_fields:
         metric = getattr(metrics, field_name, None)
         if metric is not None:
-            line = f"• {display_name}: {metric.value}"
-            if metric.yoy_change:
-                line += f" (YoY: {metric.yoy_change})"
-            lines.append(line)
+            trend_arrow = {"improving": "↑", "declining": "↓", "stable": "→"}.get(metric.trend, "")
+            rows.append((
+                display_name,
+                metric.value,
+                metric.prior_period_value or "—",
+                metric.yoy_change or "—",
+                f"{trend_arrow} {metric.trend.capitalize()}" if metric.trend else "—",
+            ))
 
-    if not lines:
+    if not rows:
         return "• No specific financial metrics extracted from filings"
+
+    lines = [
+        "| Metric | Current | Prior Period | YoY Change | Trend |",
+        "|--------|---------|--------------|------------|-------|",
+    ]
+    for name, value, prior, yoy, trend in rows:
+        lines.append(f"| {name} | {value} | {prior} | {yoy} | {trend} |")
+
+    # Add segment breakdown if available
+    if metrics.segments:
+        lines.append("")
+        lines.append("**Segment Revenue Breakdown:**")
+        lines.append("")
+        lines.append("| Segment | Revenue | % of Total | YoY |")
+        lines.append("|---------|---------|------------|-----|")
+        for seg in metrics.segments:
+            lines.append(f"| {seg.segment_name} | {seg.revenue} | {seg.pct_of_total or '—'} | {seg.yoy_change or '—'} |")
+
+    # Add guidance if available
+    if metrics.revenue_guidance or metrics.eps_guidance:
+        lines.append("")
+        lines.append("**Management Guidance:**")
+        if metrics.revenue_guidance:
+            lines.append(f"• Revenue outlook: {metrics.revenue_guidance}")
+        if metrics.eps_guidance:
+            lines.append(f"• EPS outlook: {metrics.eps_guidance}")
 
     return "\n".join(lines)
 
@@ -178,17 +211,76 @@ def _build_financial_analysis(
     synthesis: SynthesisOutput,
     metrics: MetricsOutput | None,
 ) -> str:
-    """Build the financial analysis section of the report."""
+    """Build the financial analysis section of the report with tables."""
     parts = []
 
     if metrics and metrics.summary:
         parts.append(metrics.summary)
         parts.append("")
 
-    if metrics:
-        parts.append("### Key Financial Metrics\n")
-        parts.append(_format_key_metrics(metrics))
+    # Use the synthesis agent's pre-built tables if available
+    if synthesis.financial_health_summary:
+        parts.append("### Financial Health Summary\n")
+        parts.append(synthesis.financial_health_summary)
         parts.append("")
+
+    if synthesis.key_metrics_table:
+        parts.append("### Comprehensive Metrics Dashboard\n")
+        parts.append(synthesis.key_metrics_table)
+        parts.append("")
+
+    # Fall back to formatting from raw metrics if synthesis tables are empty
+    if not synthesis.financial_health_summary and not synthesis.key_metrics_table:
+        if metrics:
+            parts.append("### Key Financial Metrics\n")
+            parts.append(_format_key_metrics(metrics))
+            parts.append("")
+
+    # Ratio dashboard
+    if metrics:
+        ratio_rows = []
+        for group_name, group in [
+            ("Profitability", metrics.profitability),
+            ("Liquidity", metrics.liquidity),
+            ("Leverage", metrics.leverage),
+            ("Efficiency", metrics.efficiency),
+        ]:
+            if group is not None:
+                for field_name in group.model_fields:
+                    metric = getattr(group, field_name, None)
+                    if metric is not None:
+                        ratio_rows.append((
+                            group_name,
+                            metric.name,
+                            metric.value,
+                            metric.yoy_change or "—",
+                        ))
+
+        if ratio_rows:
+            parts.append("### Ratio Analysis\n")
+            parts.append("| Category | Ratio | Value | YoY Change |")
+            parts.append("|----------|-------|-------|------------|")
+            for cat, name, value, yoy in ratio_rows:
+                parts.append(f"| {cat} | {name} | {value} | {yoy} |")
+            parts.append("")
+
+        # Segment breakdown table
+        if metrics.segments:
+            parts.append("### Revenue by Segment\n")
+            parts.append("| Segment | Revenue | % of Total | YoY Change |")
+            parts.append("|---------|---------|------------|------------|")
+            for seg in metrics.segments:
+                parts.append(f"| {seg.segment_name} | {seg.revenue} | {seg.pct_of_total or '—'} | {seg.yoy_change or '—'} |")
+            parts.append("")
+
+        # Guidance
+        if metrics.revenue_guidance or metrics.eps_guidance:
+            parts.append("### Management Guidance\n")
+            if metrics.revenue_guidance:
+                parts.append(f"- **Revenue outlook:** {metrics.revenue_guidance}")
+            if metrics.eps_guidance:
+                parts.append(f"- **EPS outlook:** {metrics.eps_guidance}")
+            parts.append("")
 
         if metrics.events:
             parts.append("\n### Material Events (8-K)\n")
@@ -199,14 +291,17 @@ def _build_financial_analysis(
 
         if metrics.executive_compensation:
             parts.append("\n### Executive Compensation (Proxy)\n")
+            parts.append("| Executive | Title | Total Comp | Base | Stock Awards |")
+            parts.append("|-----------|-------|------------|------|--------------|")
             for ec in metrics.executive_compensation:
-                parts.append(f"- **{ec.name}** ({ec.title}): {ec.total_compensation}")
+                parts.append(f"| {ec.name} | {ec.title} | {ec.total_compensation} | {ec.base_salary or '—'} | {ec.stock_awards or '—'} |")
     else:
-        parts.append(
-            "Financial metrics were not available for this analysis. "
-            "This may be due to filing data not being ingested into the "
-            "vector store, or the Metrics Agent encountering errors during retrieval."
-        )
+        if not synthesis.financial_health_summary:
+            parts.append(
+                "Financial metrics were not available for this analysis. "
+                "This may be due to filing data not being ingested into the "
+                "vector store, or the Metrics Agent encountering errors during retrieval."
+            )
 
     return "\n".join(parts)
 
@@ -215,7 +310,7 @@ def _build_risk_assessment(
     synthesis: SynthesisOutput,
     risk: RiskOutput | None,
 ) -> str:
-    """Build the risk assessment section of the report."""
+    """Build the risk assessment section of the report with a risk matrix table."""
     parts = []
 
     if risk:
@@ -226,19 +321,34 @@ def _build_risk_assessment(
             parts.append(f"**Key Concern:** {risk.key_concern}\n")
 
         parts.append(risk.risk_summary)
-        parts.append("\n### Identified Risks\n")
 
-        for r in risk.risks:
-            parts.append(
-                f"#### [{r.severity.value.upper()}] {r.title}\n"
-                f"**Category:** {r.category.value} | "
-                f"**Likelihood:** {r.likelihood or 'Not assessed'}\n\n"
-                f"{r.description}\n"
-            )
-            if r.potential_impact:
-                parts.append(f"**Potential Impact:** {r.potential_impact}\n")
-            if r.mitigants:
-                parts.append(f"**Mitigating Factors:** {r.mitigants}\n")
+        # Risk matrix table
+        if risk.risks:
+            parts.append("\n### Risk Matrix\n")
+            parts.append("| Risk | Category | Severity | Likelihood | Impact |")
+            parts.append("|------|----------|----------|------------|--------|")
+            for r in risk.risks:
+                impact_short = (r.potential_impact or 'Not assessed')[:80]
+                parts.append(
+                    f"| {r.title} | {r.category.value} | "
+                    f"**{r.severity.value.upper()}** | "
+                    f"{r.likelihood or 'Not assessed'} | "
+                    f"{impact_short} |"
+                )
+
+            # Detailed risk descriptions
+            parts.append("\n### Risk Details\n")
+            for r in risk.risks:
+                parts.append(
+                    f"#### [{r.severity.value.upper()}] {r.title}\n"
+                    f"**Category:** {r.category.value} | "
+                    f"**Likelihood:** {r.likelihood or 'Not assessed'}\n\n"
+                    f"{r.description}\n"
+                )
+                if r.potential_impact:
+                    parts.append(f"**Potential Impact:** {r.potential_impact}\n")
+                if r.mitigants:
+                    parts.append(f"**Mitigating Factors:** {r.mitigants}\n")
     else:
         parts.append(
             "Risk assessment was not available for this analysis. "
@@ -323,6 +433,20 @@ def generate_report(
         f"and recent news sentiment to provide a comprehensive investment view."
     )
 
+    # Build valuation section from synthesis
+    valuation_section = ""
+    if synthesis.valuation_snapshot:
+        valuation_section = (
+            f"### Valuation Snapshot\n\n{synthesis.valuation_snapshot}"
+        )
+
+    # Build SWOT section from synthesis
+    swot_section = ""
+    if synthesis.swot_analysis:
+        swot_section = (
+            f"### SWOT Analysis\n\n{synthesis.swot_analysis}"
+        )
+
     report = ResearchReport(
         title=f"{synthesis.company_name} ({synthesis.ticker}) — Equity Research Report",
         company_name=synthesis.company_name,
@@ -345,7 +469,9 @@ def generate_report(
         conclusion=(
             f"## Investment Recommendation: {rating_str}\n\n"
             f"{synthesis.rating_rationale}\n\n"
-            f"### Bull Case\n"
+            + (f"{valuation_section}\n\n" if valuation_section else "")
+            + (f"{swot_section}\n\n" if swot_section else "")
+            + f"### Bull Case\n"
             + "\n".join(f"- {s}" for s in synthesis.strengths)
             + f"\n\n### Bear Case\n"
             + "\n".join(f"- {w}" for w in synthesis.weaknesses)

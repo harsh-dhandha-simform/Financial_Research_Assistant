@@ -205,22 +205,31 @@ async def show_global_sources_tab(user_identifier: str):
 
 # ── Welcome message ──────────────────────────────────────────────────────────
 
-async def show_welcome(session: Optional[UserSession] = None):
-    """Show the welcome message for a new or returning session."""
+async def show_welcome(session: Optional[UserSession] = None, is_fresh: bool = False):
+    """Show the welcome message for a new or returning session.
+
+    Args:
+        session: The current UserSession.
+        is_fresh: If True, always show the new-session UI regardless of
+                  whether the user has existing documents. Used when the
+                  user clicks "Start Fresh" or opens a brand-new chat tab.
+    """
     nav_actions = [
         cl.Action(name="view_sources",  label="📂 View Sources",  payload={"value": "sources"}),
         cl.Action(name="view_settings", label="⚙️ View Settings", payload={"value": "settings"}),
     ]
 
-    # Check if user has any documents in the documents table
     user_id = getattr(session, "user_identifier", "") if session else ""
-    docs = []
-    if user_id:
+
+    # Only show "Welcome back" when resuming an existing thread (is_fresh=False)
+    if not is_fresh and user_id:
         from sessions.session_store import session_store
         docs = session_store.get_docs_for_user(user_id)
+    else:
+        docs = []  # Fresh session — pretend no docs for the welcome screen
 
-    if session and docs:
-        # Returning user with existing documents
+    if docs:
+        # Returning user resuming a thread that already had documents
         doc_list = "\n".join(f"  • {d.get('name', '?')}" for d in docs[:5])
         if len(docs) > 5:
             doc_list += f"\n  _...and {len(docs) - 5} more_"

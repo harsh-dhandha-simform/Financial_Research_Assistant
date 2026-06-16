@@ -146,7 +146,12 @@ AGENT_MODELS: dict[str, list[ModelConfig]] = {
         ModelConfig(
             "llama-3.3-70b-versatile", "groq",
             max_tokens=8192,
-            structured_method="json_mode",
+            structured_method="function_calling",
+        ),
+        ModelConfig(
+            "groq/compound", "groq",
+            max_tokens=8192,
+            structured_method="function_calling",
         ),
     ],
     "supervisor": [
@@ -672,12 +677,25 @@ def invoke_with_fallback(
 def create_langfuse_config(
     session_id: str = "",
     trace_name: str = "",
+    use_callbacks: bool = False,
     **kwargs,
 ) -> dict:
-    """Create a LangChain config dict with Langfuse tracing attached."""
-    handler = get_langfuse_handler(
-        session_id=session_id,
-        trace_name=trace_name,
-        **kwargs,
-    )
-    return {"callbacks": [handler]}
+    """Create a LangChain config dict with Langfuse tracing attached.
+    
+    If use_callbacks is True, creates a fresh CallbackHandler.
+    Otherwise, relies on parent callbacks for tracing to avoid UUID conflicts
+    when running multiple parallel threads, but still propagates the session_id.
+    """
+    config = {
+        "configurable": {
+            "session_id": session_id,
+        }
+    }
+    if use_callbacks:
+        handler = get_langfuse_handler(
+            session_id=session_id,
+            trace_name=trace_name,
+            **kwargs,
+        )
+        config["callbacks"] = [handler]
+    return config

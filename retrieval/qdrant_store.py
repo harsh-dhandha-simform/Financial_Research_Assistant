@@ -225,14 +225,20 @@ class QdrantStore:
             )
         query_filter = Filter(must=must_conditions) if must_conditions else None
 
-        results = self.client.query_points(
-            collection_name=self.collection_name,
-            query=query_vector,
-            query_filter=query_filter,
-            limit=top_k,
-            score_threshold=score_threshold,
-            with_payload=True,
-        )
+        try:
+            results = self.client.query_points(
+                collection_name=self.collection_name,
+                query=query_vector,
+                query_filter=query_filter,
+                limit=top_k,
+                score_threshold=score_threshold,
+                with_payload=True,
+            )
+        except Exception as e:
+            if "Not found: Collection" in str(e):
+                logger.info("Collection '%s' not found (likely empty/new session). Returning empty results.", self.collection_name)
+                return []
+            raise
 
         # Convert to RetrievedChunk objects
         retrieved: list[RetrievedChunk] = []

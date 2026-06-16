@@ -30,14 +30,63 @@ class FinancialMetric(BaseModel):
     period: str = Field(
         default="", description="Reporting period, e.g. 'FY2024', 'Q3 2024'"
     )
+    prior_period_value: str = Field(
+        default="",
+        description="Prior period value for YoY comparison, e.g. '$351.0B'",
+    )
     yoy_change: str = Field(
         default="",
         description="Year-over-year change, e.g. '+8.2%', '-3.1%'",
+    )
+    trend: str = Field(
+        default="",
+        description="Trend direction: 'improving', 'stable', or 'declining'",
     )
     source_section: str = Field(
         default="",
         description="Document section where this metric was found",
     )
+
+
+# ── Ratio groups — structured metric clusters ────────────────────────────────
+
+
+class ProfitabilityRatios(BaseModel):
+    """Profitability ratio cluster."""
+    gross_margin: FinancialMetric | None = Field(default=None, description="Gross margin %")
+    operating_margin: FinancialMetric | None = Field(default=None, description="Operating margin %")
+    net_margin: FinancialMetric | None = Field(default=None, description="Net profit margin %")
+    roe: FinancialMetric | None = Field(default=None, description="Return on equity %")
+    roa: FinancialMetric | None = Field(default=None, description="Return on assets %")
+
+
+class LiquidityRatios(BaseModel):
+    """Liquidity ratio cluster."""
+    current_ratio: FinancialMetric | None = Field(default=None, description="Current ratio")
+    quick_ratio: FinancialMetric | None = Field(default=None, description="Quick ratio")
+    cash_ratio: FinancialMetric | None = Field(default=None, description="Cash ratio")
+
+
+class LeverageRatios(BaseModel):
+    """Leverage ratio cluster."""
+    debt_to_equity: FinancialMetric | None = Field(default=None, description="Debt-to-equity ratio")
+    interest_coverage: FinancialMetric | None = Field(default=None, description="Interest coverage ratio")
+    debt_to_ebitda: FinancialMetric | None = Field(default=None, description="Debt/EBITDA ratio")
+
+
+class EfficiencyRatios(BaseModel):
+    """Efficiency ratio cluster."""
+    asset_turnover: FinancialMetric | None = Field(default=None, description="Asset turnover ratio")
+    inventory_turnover: FinancialMetric | None = Field(default=None, description="Inventory turnover")
+    receivables_turnover: FinancialMetric | None = Field(default=None, description="Receivables turnover")
+
+
+class SegmentBreakdown(BaseModel):
+    """Revenue breakdown by business segment."""
+    segment_name: str = Field(..., description="Segment name, e.g. 'iPhone', 'Services'")
+    revenue: str = Field(..., description="Segment revenue, e.g. '$200.6B'")
+    pct_of_total: str = Field(default="", description="Percentage of total revenue, e.g. '52.2%'")
+    yoy_change: str = Field(default="", description="YoY change, e.g. '+5.3%'")
 
 
 class MetricsOutput(BaseModel):
@@ -105,6 +154,40 @@ class MetricsOutput(BaseModel):
         description="Any other notable metrics not covered above",
     )
 
+    # ── Ratio groups (structured clusters) ─────────────────────────────────
+    profitability: ProfitabilityRatios | None = Field(
+        default=None, description="Profitability ratios (margins, ROE, ROA)"
+    )
+    liquidity: LiquidityRatios | None = Field(
+        default=None, description="Liquidity ratios (current, quick, cash)"
+    )
+    leverage: LeverageRatios | None = Field(
+        default=None, description="Leverage ratios (D/E, interest coverage, Debt/EBITDA)"
+    )
+    efficiency: EfficiencyRatios | None = Field(
+        default=None, description="Efficiency ratios (asset turnover, inventory, receivables)"
+    )
+
+    # ── Segment breakdowns ─────────────────────────────────────────────────
+    segments: list[SegmentBreakdown] = Field(
+        default_factory=list,
+        description="Revenue breakdown by business segment",
+    )
+
+    # ── Guidance & forward-looking ─────────────────────────────────────────
+    revenue_guidance: str = Field(
+        default="", description="Management revenue guidance/outlook, e.g. '$400-410B'"
+    )
+    eps_guidance: str = Field(
+        default="", description="Management EPS guidance, e.g. '$6.50-6.70'"
+    )
+    filing_type: str = Field(
+        default="", description="Filing type detected: '10-K', '10-Q', '8-K', etc."
+    )
+    fiscal_year_end: str = Field(
+        default="", description="Fiscal year end date, e.g. 'September 28, 2024'"
+    )
+
     # ── 8-K material events (populated only for 8-K filings) ──────────────
     events: list["MaterialEvent"] = Field(
         default_factory=list,
@@ -118,7 +201,7 @@ class MetricsOutput(BaseModel):
     )
 
     summary: str = Field(
-        ..., description="2-3 sentence summary of the company's financial position"
+        ..., description="3-5 sentence summary of the company's financial position"
     )
     confidence: float = Field(
         default=0.0,
@@ -366,6 +449,36 @@ class SynthesisOutput(BaseModel):
     catalysts: list[str] = Field(
         default_factory=list,
         description="Upcoming catalysts that could move the stock",
+    )
+
+    # ── Pre-formatted summary tables (markdown) ──────────────────────────────
+    financial_health_summary: str = Field(
+        default="",
+        description=(
+            "Markdown table summarising key financial metrics: "
+            "| Metric | Current | Prior | YoY Change | Trend |"
+        ),
+    )
+    valuation_snapshot: str = Field(
+        default="",
+        description=(
+            "Markdown table of valuation metrics: "
+            "| Metric | Value | Interpretation |"
+        ),
+    )
+    swot_analysis: str = Field(
+        default="",
+        description=(
+            "Structured SWOT analysis in markdown format covering "
+            "Strengths, Weaknesses, Opportunities, and Threats"
+        ),
+    )
+    key_metrics_table: str = Field(
+        default="",
+        description=(
+            "Comprehensive markdown table of ALL extracted financial metrics "
+            "for easy scanning"
+        ),
     )
 
     # ── Confidence ───────────────────────────────────────────────────────────

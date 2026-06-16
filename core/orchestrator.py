@@ -61,9 +61,13 @@ class UnifiedOrchestrator:
         
         # 1. Handle explicit attachments first
         if attachments:
-            pdf_files = [a for a in attachments if getattr(a, "path", "").endswith(".pdf")]
+            IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+            pdf_files = [a for a in attachments if getattr(a, "path", "").lower().endswith(".pdf")]
+            img_files = [a for a in attachments if getattr(a, "path", "").lower().endswith(IMAGE_EXTS)]
             if pdf_files:
                 return await self._handle_file_upload(pdf_files[0], session_id, user_input)
+            if img_files:
+                return await self._handle_image_upload(img_files[0], session_id, user_input)
                 
         # 2. Intent Routing (returns IntentResult)
         intent_result: IntentResult = route_intent(user_input, session_id)
@@ -126,6 +130,21 @@ class UnifiedOrchestrator:
                 "file_path": file_element.path,
                 "file_name": filename,
                 "company_name": user_input.strip() or filename.replace(".pdf", "")
+            }
+        )
+
+    async def _handle_image_upload(self, file_element, session_id: str, user_input: str) -> OrchestratorResponse:
+        """Handle image file (.png/.jpg/.jpeg) upload."""
+        filename = getattr(file_element, "name", "image.png")
+        
+        return OrchestratorResponse(
+            content=f"Received image `{filename}` for ingestion.",
+            intent=UserIntent.INGEST_DOC.value,
+            action_required="trigger_image_ingestion",
+            data={
+                "file_path": file_element.path,
+                "file_name": filename,
+                "company_name": user_input.strip() or filename.rsplit(".", 1)[0],
             }
         )
 

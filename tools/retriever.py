@@ -63,8 +63,8 @@ def rebuild_bm25_index(collection_name: str):
     try:
         # Force initialization if not exists
         hybrid = _get_hybrid(collection_name)
-        count = hybrid.sparse_retriever.build_from_qdrant(
-            hybrid.dense_retriever.client, collection_name
+        count = hybrid.bm25_retriever.build_from_qdrant(
+            hybrid.qdrant_store.client, collection_name
         )
         logger.info("BM25 index rebuilt for '%s': %d chunks re-indexed", collection_name, count)
     except Exception as exc:

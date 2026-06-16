@@ -50,8 +50,9 @@ def test_supervisor_only():
     ])
 
     config = create_langfuse_config(
-        session_id="e2e-test",
-        trace_name="test-supervisor",
+        session_id="test_e2e_pipeline",
+        trace_name="test-full-pipeline",
+        use_callbacks=True,
     )
 
     start = time.time()

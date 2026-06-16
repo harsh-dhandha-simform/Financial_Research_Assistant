@@ -10,3 +10,5 @@ __pycache__/
 /test/em.py
 /data
 .files/
+/logs
+to change.txt

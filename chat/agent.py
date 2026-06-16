@@ -222,6 +222,7 @@ def chat(
     config = create_langfuse_config(
         session_id=session_id,
         trace_name="chat-agent",
+        use_callbacks=True,
     )
 
     max_attempts = len(settings.google_api_keys) if settings.google_api_keys else 1
