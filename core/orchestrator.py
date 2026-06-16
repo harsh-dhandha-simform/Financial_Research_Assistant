@@ -98,10 +98,8 @@ class UnifiedOrchestrator:
             )
             
         elif intent == UserIntent.CHITCHAT.value:
-            return OrchestratorResponse(
-                content="Hello! I'm your Financial Research Assistant. I can analyze SEC filings, run risk assessments, or answer specific financial questions about companies. How can I help you today?",
-                intent=intent
-            )
+            # Handle conversational queries using the chat agent but without RAG retrieval
+            return await self._handle_rag_chat(user_input, session_id, skip_rag=True)
             
         elif intent == UserIntent.OUT_OF_DOMAIN.value:
             return OrchestratorResponse(
@@ -208,11 +206,12 @@ class UnifiedOrchestrator:
             }
         )
 
-    async def _handle_rag_chat(self, user_input: str, session_id: str) -> OrchestratorResponse:
+    async def _handle_rag_chat(self, user_input: str, session_id: str, skip_rag: bool = False) -> OrchestratorResponse:
         """Handle a standard Q&A chat turn."""
         return OrchestratorResponse(
             content="",  # Content will be streamed by the UI layer calling chat.agent
-            intent=UserIntent.RAG_CHAT.value,
-            action_required="trigger_chat_agent"
+            intent=UserIntent.RAG_CHAT.value if not skip_rag else UserIntent.CHITCHAT.value,
+            action_required="trigger_chat_agent",
+            data={"skip_rag": skip_rag}
         )
 

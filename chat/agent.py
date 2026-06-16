@@ -37,10 +37,6 @@ from schemas.chat import ChatResponse
 logger = logging.getLogger(__name__)
 
 
-# ── Short-term memory: session_id → message history ─────────────────────────
-# In production, swap this for Redis or PostgresSaver.
-_sessions: dict[str, list] = {}
-
 # ── Pipeline result cache: session_id → ResearchState summary ────────────────
 _pipeline_context: dict[str, str] = {}
 
@@ -71,16 +67,8 @@ def store_pipeline_context(session_id: str, context: str):
     logger.info("Stored pipeline context for session '%s' (%d chars)", session_id, len(context))
 
 
-def get_session_history(session_id: str) -> list:
-    """Get or create message history for a session."""
-    if session_id not in _sessions:
-        _sessions[session_id] = []
-    return _sessions[session_id]
-
-
 def clear_session(session_id: str):
     """Clear a session's message history."""
-    _sessions.pop(session_id, None)
     _pipeline_context.pop(session_id, None)
     logger.info("Cleared session '%s'", session_id)
 
@@ -140,6 +128,8 @@ def chat(
     section_filter: str = "",
     top_k: int = 6,
     user_id: str = "",
+    skip_rag: bool = False,
+    history: list[dict] = None,
 ) -> ChatResponse:
     """Process a chat question with RAG retrieval and conversation memory.
 
@@ -163,10 +153,20 @@ def chat(
     if not session_id:
         session_id = f"chat-{uuid.uuid4().hex[:8]}"
 
-    history = get_session_history(session_id)
+    if history is None:
+        history = []
+        
+    langchain_history = []
+    for msg in history[-12:]:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "user":
+            langchain_history.append(HumanMessage(content=content))
+        elif role == "assistant":
+            langchain_history.append(AIMessage(content=content))
 
     # ── 1. Query rewriting (resolve pronouns using history) ──────────
-    chat_history_str = _format_chat_history(history)
+    chat_history_str = _format_chat_history(langchain_history)
     try:
         rewritten = query_rewriter.invoke({
             "question": question,
@@ -178,7 +178,10 @@ def chat(
     logger.info("Chat query: '%s' → rewritten: '%s'", question[:60], rewritten[:60])
 
     # ── 2. RAG retrieval ─────────────────────────────────────────────
-    rag_context, sources = _retrieve_context(rewritten, section_filter, top_k, session_id, user_id)
+    if not skip_rag:
+        rag_context, sources = _retrieve_context(rewritten, section_filter, top_k, session_id, user_id)
+    else:
+        rag_context, sources = "", []
 
     # ── 3. Include pipeline context if available ─────────────────────
     pipeline_ctx = _pipeline_context.get(session_id, "")
@@ -197,7 +200,7 @@ def chat(
     ]
 
     # Add conversation history (last 6 turns for context window)
-    for msg in history[-12:]:
+    for msg in langchain_history[-12:]:
         messages.append(msg)
 
     # Build the user message with context
@@ -206,6 +209,9 @@ def chat(
             f"Context:\n{full_context}\n\n"
             f"Question: {question}"
         )
+    elif skip_rag:
+        # Conversational / chitchat queries that don't need context
+        user_msg = f"Question: {question}"
     else:
         user_msg = (
             f"No relevant documents found for this query. "

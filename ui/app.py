@@ -57,6 +57,23 @@ import ui.auth  # Registers @cl.password_auth_callback
 
 logger = logging.getLogger(__name__)
 
+from functools import wraps
+
+def with_processing_lock(func):
+    """Decorator to prevent concurrent execution of message handlers/actions."""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        if cl.user_session.get("is_processing"):
+            await cl.Message(content="⏳ **A request is currently processing.** Please wait for it to complete.").send()
+            return
+        
+        cl.user_session.set("is_processing", True)
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            cl.user_session.set("is_processing", False)
+    return wrapper
+
 # Singleton orchestrator
 orchestrator = UnifiedOrchestrator()
 
@@ -67,10 +84,16 @@ orchestrator = UnifiedOrchestrator()
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 from config import settings
 
+class CustomDataLayer(SQLAlchemyDataLayer):
+    async def create_element(self, element: "Element"):
+        # We manage documents and images ourselves. Skip Chainlit's default blob storage
+        # to prevent the "No blob_storage_client is configured" warning.
+        pass
+
 @cl.data_layer
 def get_data_layer():
     """Mount the SQLAlchemy Data Layer for Supabase persistence."""
-    return SQLAlchemyDataLayer(
+    return CustomDataLayer(
         conninfo=settings.supabase_uri,
         connect_args={"statement_cache_size": 0}
     )
@@ -206,6 +229,29 @@ def _chunk_and_store(raw_doc, collection_name: str, doc_id: str = "", user_id: s
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+import re
+
+def extract_clean_thread_id(raw_thread) -> str:
+    """Robustly extract a clean thread ID from whatever Chainlit passes us."""
+    raw_str = str(raw_thread)
+    # 1. Look for standard UUID
+    match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', raw_str, re.I)
+    if match:
+        return match.group(1)
+        
+    # 2. Check if it's a dict with an id
+    if isinstance(raw_thread, dict) and "id" in raw_thread:
+        val = str(raw_thread["id"])
+        if len(val) < 50 and "{" not in val:
+            return val
+            
+    # 3. Use as-is if it's a short simple string
+    if len(raw_str) < 50 and "{" not in raw_str:
+        return raw_str
+        
+    # 4. Fallback
+    return f"cl-{uuid.uuid4().hex[:8]}"
+
 @cl.on_chat_start
 async def on_start():
     """Initialize or restore session using the Chainlit thread_id as the canonical session_id."""
@@ -215,28 +261,10 @@ async def on_start():
     except Exception:
         pass
 
-    # Use the actual Chainlit thread_id, NOT a generated UUID
+    # Use the robust extraction helper
     thread_id_raw = cl.context.session.thread_id or cl.user_session.get("id")
-    if isinstance(thread_id_raw, dict):
-        thread_id = thread_id_raw.get("id") or thread_id_raw.get("session_id")
-    elif isinstance(thread_id_raw, str) and thread_id_raw.startswith("{"):
-        import ast
-        try:
-            parsed = ast.literal_eval(thread_id_raw)
-            if isinstance(parsed, dict):
-                thread_id = parsed.get("id") or parsed.get("session_id")
-            else:
-                thread_id = thread_id_raw
-        except Exception:
-            thread_id = thread_id_raw
-    else:
-        thread_id = thread_id_raw
-        
-    # Extra safety check to ensure thread_id is a string and not excessively long
-    if not isinstance(thread_id, str) or len(thread_id) > 50:
-        logger.warning("Invalid thread_id extracted (%s), falling back to generated UUID", type(thread_id))
-        thread_id = f"cl-{uuid.uuid4().hex[:8]}"
-        
+    thread_id = extract_clean_thread_id(thread_id_raw)
+
     if not thread_id:
         thread_id = f"cl-{uuid.uuid4().hex[:8]}"
         
@@ -250,10 +278,49 @@ async def on_start():
     if session:
         # Existing thread — re-hydrate, do NOT create new collection
         cl.user_session.set("session", session)
-        cl.user_session.set("memo_obj", None)
-        cl.user_session.set("report_obj", None)
+        
+        # Hydrate memo and report if available to restore action buttons
+        if session.last_pipeline_result:
+            memo_data = session.last_pipeline_result.get("memo")
+            report_data = session.last_pipeline_result.get("report")
+            
+            from schemas.reports import InvestmentMemo, ResearchReport
+            if memo_data:
+                try:
+                    cl.user_session.set("memo_obj", InvestmentMemo(**memo_data))
+                except Exception:
+                    cl.user_session.set("memo_obj", None)
+            else:
+                cl.user_session.set("memo_obj", None)
+                
+            if report_data:
+                try:
+                    cl.user_session.set("report_obj", ResearchReport(**report_data))
+                except Exception:
+                    cl.user_session.set("report_obj", None)
+            else:
+                cl.user_session.set("report_obj", None)
+        else:
+            cl.user_session.set("memo_obj", None)
+            cl.user_session.set("report_obj", None)
+            
         logger.info("Loaded existing session %s for user %s", thread_id[:8], user_id)
         await show_welcome(session, is_fresh=False)  # Returning to existing thread
+        
+        # Re-render the action buttons if a pipeline was run
+        if session.last_pipeline_result:
+            company = session.last_pipeline_result.get("company_name", session.company_name or "company")
+            await show_pipeline_actions(company)
+            
+        # Replay chat history if any
+        if session.chat_history:
+            for msg_data in session.chat_history:
+                role = msg_data.get("role")
+                content = msg_data.get("content")
+                if role == "user":
+                    await cl.Message(content=content, author="User").send()
+                elif role == "assistant":
+                    await cl.Message(content=content, author="Assistant").send()
     else:
         # Genuinely new thread — always show new-session welcome UI
         session = session_store.create_new(thread_id, user_id)
@@ -295,7 +362,7 @@ async def on_resume(thread):
 
     NEVER creates a new session or a new collection here.
     """
-    thread_id = thread.id if hasattr(thread, "id") else str(thread)
+    thread_id = extract_clean_thread_id(thread)
     cl.user_session.set("session_id", thread_id)
 
     user = cl.user_session.get("user")
@@ -304,8 +371,37 @@ async def on_resume(thread):
     session = session_store.get_by_thread(thread_id, user_id)
     if session:
         cl.user_session.set("session", session)
-        cl.user_session.set("memo_obj", None)
-        cl.user_session.set("report_obj", None)
+        
+        # Hydrate memo and report if available to restore action buttons
+        if session.last_pipeline_result:
+            memo_data = session.last_pipeline_result.get("memo")
+            report_data = session.last_pipeline_result.get("report")
+            
+            from schemas.reports import InvestmentMemo, ResearchReport
+            if memo_data:
+                try:
+                    cl.user_session.set("memo_obj", InvestmentMemo(**memo_data))
+                except Exception:
+                    cl.user_session.set("memo_obj", None)
+            else:
+                cl.user_session.set("memo_obj", None)
+                
+            if report_data:
+                try:
+                    cl.user_session.set("report_obj", ResearchReport(**report_data))
+                except Exception:
+                    cl.user_session.set("report_obj", None)
+            else:
+                cl.user_session.set("report_obj", None)
+                
+            # Render the action buttons again so the user can export/view after reload
+            if memo_data or report_data:
+                company = session.last_pipeline_result.get("company_name", session.company_name or "company")
+                await show_pipeline_actions(company)
+        else:
+            cl.user_session.set("memo_obj", None)
+            cl.user_session.set("report_obj", None)
+
         logger.info("Resumed session %s for user %s", thread_id[:8], user_id)
     else:
         # Thread exists in Chainlit but not in our session DB — create it
@@ -328,6 +424,7 @@ async def on_end():
 
 
 @cl.on_message
+@with_processing_lock
 async def on_message(message: cl.Message):
     """Main message handler for slash commands, files, and chat Q&A."""
     session_id = cl.user_session.get("session_id", "")
@@ -394,7 +491,8 @@ async def on_message(message: cl.Message):
         await _handle_image_upload_action(response.data, session_id, session)
 
     elif action == "trigger_chat_agent":
-        await _handle_chat(user_input, session_id)
+        skip_rag = response.data.get("skip_rag", False) if response.data else False
+        await _handle_chat(user_input, session_id, skip_rag=skip_rag)
 
     elif action == "show_export_buttons":
         memo_obj = cl.user_session.get("memo_obj")
@@ -530,6 +628,8 @@ async def _handle_pipeline(data: dict, session_id: str, session: UserSession):
                 "company_name": company_name,
                 "ticker": ticker,
                 "rating": state.synthesis_output.rating.value if state.synthesis_output else None,
+                "memo": state.memo.model_dump() if state.memo else None,
+                "report": state.report.model_dump() if state.report else None,
             }
             session_store.update(session)
 
@@ -1046,7 +1146,7 @@ async def _handle_delete_command(session_id: str):
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-async def _handle_chat(question: str, session_id: str):
+async def _handle_chat(question: str, session_id: str, skip_rag: bool = False):
     """Handle a chat question with RAG retrieval + source footer (Change 12)."""
     msg = cl.Message(content="")
     await msg.send()
@@ -1054,10 +1154,13 @@ async def _handle_chat(question: str, session_id: str):
     try:
         _session: UserSession = cl.user_session.get("session")
         _user_id = _session.user_identifier if _session else ""
+        _history = _session.chat_history if _session else []
         response = chat(
             question=question,
             session_id=session_id,
             user_id=_user_id,
+            skip_rag=skip_rag,
+            history=_history,
         )
 
         answer = response.answer
@@ -1159,6 +1262,7 @@ async def on_ask_questions(action):
 
 
 @cl.action_callback("run_analysis")
+@with_processing_lock
 async def on_run_analysis(action):
     """Handle Run Full Analysis button click."""
     company_name = action.payload.get("value")
@@ -1323,6 +1427,7 @@ async def on_copy_msg(action):
 
 
 @cl.action_callback("regenerate")
+@with_processing_lock
 async def on_regenerate(action):
     question = action.payload.get("question", "") if action.payload else ""
     if question:
@@ -1350,7 +1455,8 @@ async def _show_help():
             "| Ask questions | Just type your question |\n"
             "| View sources | `/sources` |\n"
             "| Session info | `/session` |\n"
-            "| Clear session | `/clear` |\n\n"
+            "| Clear session | `/clear` |\n"
+            "| Delete all data | `/delete` |\n\n"
             "**Navigation:**\n"
             "- 💬 **Chat** — Main interface (upload, analyze, ask)\n"
             "- 📁 **Sources** — View ingested documents\n"

@@ -151,7 +151,7 @@ AGENT_MODELS: dict[str, list[ModelConfig]] = {
         ModelConfig(
             "groq/compound", "groq",
             max_tokens=8192,
-            structured_method="function_calling",
+            structured_method="json_mode",
         ),
     ],
     "supervisor": [
@@ -273,6 +273,12 @@ def _create_llm(config: ModelConfig) -> ChatOpenAI:
     # Disable built-in retries for Google so our manual fallback/rotation takes over instantly
     if config.provider == "google":
         kwargs["max_retries"] = 0
+
+    # For groq/compound, pass its required compound_custom config
+    if config.model_id == "groq/compound":
+        kwargs["model_kwargs"] = {
+            "compound_custom": {"tools": {"enabled_tools": ["web_search", "wolfram_aplha", "visit_website"]}}
+        }
 
     return ChatOpenAI(**kwargs)
 
