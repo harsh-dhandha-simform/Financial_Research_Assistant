@@ -12,3 +12,5 @@ __pycache__/
 .files/
 /logs
 to change.txt
+.deepeval/
+trace-019eca5f-f5eb-7e72-acb2-3d8937c94304.json

@@ -425,6 +425,19 @@ class SessionStore:
     def _deserialize(data_json) -> UserSession:
         """Reconstruct a UserSession from its JSON representation."""
         data = json.loads(data_json) if isinstance(data_json, str) else data_json
+        
+        # Safely coerce chat_history — it may be double-encoded as a JSON string
+        raw_history = data.get("chat_history", [])
+        if isinstance(raw_history, str):
+            try:
+                raw_history = json.loads(raw_history)
+            except Exception:
+                raw_history = []
+        if not isinstance(raw_history, list):
+            raw_history = []
+        # Drop any entries that are not dicts
+        raw_history = [m for m in raw_history if isinstance(m, dict)]
+        
         return UserSession(
             session_id=data["session_id"],
             thread_id=data.get("thread_id", data["session_id"]),
@@ -433,7 +446,7 @@ class SessionStore:
             collection_name=data.get("collection_name", ""),
             pipeline_status=data.get("pipeline_status", "idle"),
             last_pipeline_result=data.get("last_pipeline_result"),
-            chat_history=data.get("chat_history", []),
+            chat_history=raw_history,
             company_name=data.get("company_name", ""),
             ticker=data.get("ticker", ""),
             user_identifier=data.get("user_identifier", ""),

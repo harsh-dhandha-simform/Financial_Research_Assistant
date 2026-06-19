@@ -60,9 +60,22 @@ logger = logging.getLogger(__name__)
 from functools import wraps
 
 def with_processing_lock(func):
-    """Decorator to prevent concurrent execution of message handlers/actions."""
+    """Decorator to prevent concurrent execution of message handlers/actions.
+    
+    For pipeline actions: the on_message handler returns early (spawning a bg task)
+    so the finally block must NOT clear is_processing — the bg task does that.
+    For all other actions (chat, ingestion, etc.): clear is_processing on exit.
+    """
     @wraps(func)
     async def wrapper(*args, **kwargs):
+        session = cl.user_session.get("session")
+        
+        # Check persistent DB state (survives page reloads)
+        if session and getattr(session, "pipeline_status", "") == "running":
+            await cl.Message(content="⏳ **A research pipeline is already running for this session.** Please wait for it to complete before sending new requests.").send()
+            return
+            
+        # Check in-memory websocket state
         if cl.user_session.get("is_processing"):
             await cl.Message(content="⏳ **A request is currently processing.** Please wait for it to complete.").send()
             return
@@ -71,7 +84,11 @@ def with_processing_lock(func):
         try:
             return await func(*args, **kwargs)
         finally:
-            cl.user_session.set("is_processing", False)
+            # Only clear if a background pipeline task isn't still running.
+            # Pipeline tasks clear is_processing themselves when they finish.
+            session_after = cl.user_session.get("session")
+            if not (session_after and getattr(session_after, "pipeline_status", "") == "running"):
+                cl.user_session.set("is_processing", False)
     return wrapper
 
 # Singleton orchestrator
@@ -88,6 +105,8 @@ class CustomDataLayer(SQLAlchemyDataLayer):
     async def create_element(self, element: "Element"):
         # We manage documents and images ourselves. Skip Chainlit's default blob storage
         # to prevent the "No blob_storage_client is configured" warning.
+        if element.__class__.__name__ == "Action":
+            return await super().create_element(element)
         pass
 
 @cl.data_layer
@@ -276,10 +295,28 @@ async def on_start():
     # Check if this thread already has a session (e.g. page refresh on same thread)
     session = session_store.get_by_thread(thread_id, user_id)
     if session:
+        # ── Auto-recover stuck pipeline_status ────────────────────────────────
+        # If status is 'running' but we're in on_start, the process is clearly gone.
+        # Recover based on whether results exist:
+        if getattr(session, "pipeline_status", "") == "running":
+            if session.last_pipeline_result:
+                # Results saved — pipeline finished, just status update was lost
+                session.pipeline_status = "done"
+            else:
+                # No results — pipeline was interrupted before completing
+                session.pipeline_status = "idle"
+            session_store.update(session)
+            logger.info(
+                "Auto-recovered stuck pipeline_status for session %s",
+                thread_id[:8]
+            )
+
         # Existing thread — re-hydrate, do NOT create new collection
         cl.user_session.set("session", session)
+        cl.user_session.set("is_processing", False)  # always clear in-memory lock on load
         
         # Hydrate memo and report if available to restore action buttons
+        has_results = False
         if session.last_pipeline_result:
             memo_data = session.last_pipeline_result.get("memo")
             report_data = session.last_pipeline_result.get("report")
@@ -288,6 +325,7 @@ async def on_start():
             if memo_data:
                 try:
                     cl.user_session.set("memo_obj", InvestmentMemo(**memo_data))
+                    has_results = True
                 except Exception:
                     cl.user_session.set("memo_obj", None)
             else:
@@ -296,6 +334,7 @@ async def on_start():
             if report_data:
                 try:
                     cl.user_session.set("report_obj", ResearchReport(**report_data))
+                    has_results = True
                 except Exception:
                     cl.user_session.set("report_obj", None)
             else:
@@ -307,9 +346,9 @@ async def on_start():
         logger.info("Loaded existing session %s for user %s", thread_id[:8], user_id)
         await show_welcome(session, is_fresh=False)  # Returning to existing thread
         
-        # Re-render the action buttons if a pipeline was run
-        if session.last_pipeline_result:
-            company = session.last_pipeline_result.get("company_name", session.company_name or "company")
+        # If pipeline results exist, immediately show the action buttons
+        if has_results:
+            company = session.last_pipeline_result.get("company_name", session.company_name or "your analysis")
             await show_pipeline_actions(company)
             
         # Replay chat history if any
@@ -394,10 +433,7 @@ async def on_resume(thread):
             else:
                 cl.user_session.set("report_obj", None)
                 
-            # Render the action buttons again so the user can export/view after reload
-            if memo_data or report_data:
-                company = session.last_pipeline_result.get("company_name", session.company_name or "company")
-                await show_pipeline_actions(company)
+            # Action buttons are now persisted naturally by CustomDataLayer
         else:
             cl.user_session.set("memo_obj", None)
             cl.user_session.set("report_obj", None)
@@ -475,11 +511,40 @@ async def on_message(message: cl.Message):
     # ── Handle orchestrator response ──────────────────────────────────
     action = response.action_required
 
-    if action == "trigger_research_pipeline":
-        await _handle_pipeline(response.data, session_id, session)
+    if action == "trigger_research_pipeline" or action == "trigger_single_agent":
+        # Run pipeline in a background task so the WebSocket stays alive for 2+ min runs.
+        # asyncio ContextVars are NOT automatically inherited by new tasks, so we capture
+        # the ChainlitContext object directly and re-set it inside the task.
+        from chainlit.context import context_var
+        _cl_context = context_var.get()   # capture current Chainlit context
+        _pipeline_data = response.data
+        _pipeline_session_id = session_id
+        _pipeline_session = session
 
-    elif action == "trigger_single_agent":
-        await _handle_pipeline(response.data, session_id, session)
+        async def _pipeline_bg_task():
+            # Re-bind the Chainlit context inside this task so cl.Message() routes correctly
+            token = context_var.set(_cl_context)
+            try:
+                await _handle_pipeline(_pipeline_data, _pipeline_session_id, _pipeline_session)
+            except Exception as exc:
+                logger.exception("Background pipeline task failed: %s", exc)
+                try:
+                    await cl.Message(content=f"❌ **Pipeline crashed:** {_format_error(exc)}").send()
+                except Exception:
+                    pass
+            finally:
+                context_var.reset(token)
+                try:
+                    cl.user_session.set("is_processing", False)
+                except Exception:
+                    pass
+
+        asyncio.ensure_future(_pipeline_bg_task())
+        # Return immediately — on_message exits, WebSocket heartbeat stays healthy
+        return
+
+
+
 
     elif action == "trigger_pdf_ingestion":
         await _handle_pdf_upload_action(response.data, session_id, session)
@@ -1154,7 +1219,15 @@ async def _handle_chat(question: str, session_id: str, skip_rag: bool = False):
     try:
         _session: UserSession = cl.user_session.get("session")
         _user_id = _session.user_identifier if _session else ""
-        _history = _session.chat_history if _session else []
+        raw_history = _session.chat_history if _session else []
+        # Guard: coerce to clean list[dict] — handles double-encoded strings from DB
+        if not isinstance(raw_history, list):
+            try:
+                import json as _json
+                raw_history = _json.loads(raw_history) if isinstance(raw_history, str) else []
+            except Exception:
+                raw_history = []
+        _history = [m for m in raw_history if isinstance(m, dict)]
         response = chat(
             question=question,
             session_id=session_id,
@@ -1199,7 +1272,7 @@ async def _handle_chat(question: str, session_id: str, skip_rag: bool = False):
         err_msg = _format_error(exc)
         msg.content = f"❌ Error: {err_msg}"
         await msg.update()
-        logger.error("Chat failed: %s", exc)
+        logger.exception("Chat failed: %s", exc)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1429,7 +1502,8 @@ async def on_copy_msg(action):
 @cl.action_callback("regenerate")
 @with_processing_lock
 async def on_regenerate(action):
-    question = action.payload.get("question", "") if action.payload else ""
+    payload = action.payload if isinstance(action.payload, dict) else {}
+    question = payload.get("question", "") if payload else ""
     if question:
         session_id = cl.user_session.get("session_id", "")
         await _handle_chat(question, session_id)
@@ -1449,10 +1523,11 @@ async def _show_help():
             "## 📊 Financial Research Assistant — Help\n\n"
             "| Action | How |\n"
             "|--------|-----|\n"
-            "| Upload a PDF | Drag & drop a file |\n"
+            "| Upload Document | Drag & drop a PDF or Image |\n"
             "| Ingest a URL | `/ingest <EDGAR URL>` |\n"
             "| Run full analysis | `Analyze Apple AAPL` |\n"
-            "| Ask questions | Just type your question |\n"
+            "| Ask questions | Just type your question (RAG context used) |\n"
+            "| General Chat | Ask general questions (bypasses RAG automatically) |\n"
             "| View sources | `/sources` |\n"
             "| Session info | `/session` |\n"
             "| Clear session | `/clear` |\n"
@@ -1463,6 +1538,7 @@ async def _show_help():
             "- ⚙️ **Settings** — Session info & management\n\n"
             "**Tips:**\n"
             "- I auto-detect your intent — no need to switch tabs\n"
+            "- I remember previous chat messages for context automatically\n"
             "- After analysis, use action buttons to view/export results\n"
             "- I use RAG to search your ingested documents"
         )

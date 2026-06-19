@@ -17,6 +17,7 @@ without re-running agents.
 Short-term memory: LangChain message history stored per session_id.
 """
 
+from sqlalchemy.orm.session import _sessions
 import logging
 import uuid
 from typing import Any
@@ -108,8 +109,12 @@ def _retrieve_context(query: str, section_filter: str = "", top_k: int = 6, sess
         
         context_parts = []
         for i, doc in enumerate(docs):
-            section = doc.metadata.get("section", "unknown")
-            score = doc.metadata.get("score", 0)
+            if isinstance(doc.metadata, dict):
+                section = doc.metadata.get("section", "unknown")
+                score = doc.metadata.get("score", 0)
+            else:
+                section = "unknown"
+                score = 0
             context_parts.append(
                 f"[Source {i+1} | Section: {section} | Relevance: {score:.3f}]\n"
                 f"{doc.page_content}\n"
@@ -153,17 +158,22 @@ def chat(
     if not session_id:
         session_id = f"chat-{uuid.uuid4().hex[:8]}"
 
-    if history is None:
+    if not isinstance(history, list):
         history = []
-        
+
     langchain_history = []
-    for msg in history[-12:]:
-        role = msg.get("role")
-        content = msg.get("content", "")
-        if role == "user":
-            langchain_history.append(HumanMessage(content=content))
-        elif role == "assistant":
-            langchain_history.append(AIMessage(content=content))
+    safe_history = [m for m in history[-12:] if isinstance(m, dict)]
+    for msg in safe_history:
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "user":
+                langchain_history.append(HumanMessage(content=content))
+            elif role == "assistant":
+                langchain_history.append(AIMessage(content=content))
+        elif hasattr(msg, "type"):
+            # It's already a LangChain message (or similar)
+            langchain_history.append(msg)
 
     # ── 1. Query rewriting (resolve pronouns using history) ──────────
     chat_history_str = _format_chat_history(langchain_history)
@@ -184,7 +194,7 @@ def chat(
         rag_context, sources = "", []
 
     # ── 3. Include pipeline context if available ─────────────────────
-    pipeline_ctx = _pipeline_context.get(session_id, "")
+    pipeline_ctx = _pipeline_context.get(session_id, "") if isinstance(_pipeline_context, dict) else ""
     full_context = ""
     if pipeline_ctx:
         full_context += f"=== PIPELINE ANALYSIS RESULTS ===\n{pipeline_ctx}\n\n"
