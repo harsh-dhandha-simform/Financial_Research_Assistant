@@ -120,7 +120,7 @@ AGENT_MODELS: dict[str, list[ModelConfig]] = {
             "llama-3.3-70b-versatile", "groq",
             max_tokens=8192,  # Keep low to avoid Groq TPM limits
             structured_method="json_mode",
-            max_tool_output_chars=1500,  # Tighter limit for free-tier Groq
+            max_tool_output_chars=2500,  # Tighter limit for free-tier Groq
         ),
         ModelConfig(
             "qwen/qwen3-32b", "groq",
@@ -141,7 +141,7 @@ AGENT_MODELS: dict[str, list[ModelConfig]] = {
             "llama-3.3-70b-versatile", "groq",
             max_tokens=11000,
             structured_method="json_mode",
-            max_tool_output_chars=1500,
+            max_tool_output_chars=2500,
         ),
     ],
     "news": [
@@ -160,6 +160,11 @@ AGENT_MODELS: dict[str, list[ModelConfig]] = {
         ),
         ModelConfig(
             "groq/compound", "groq",
+            max_tokens=8192,
+            structured_method="json_mode",
+        ),
+        ModelConfig(
+            "zai-glm-4.7", "cerebras",
             max_tokens=8192,
             structured_method="json_mode",
         ),

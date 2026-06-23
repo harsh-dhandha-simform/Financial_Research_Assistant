@@ -72,6 +72,109 @@ class UnifiedOrchestrator:
         # 2. Intent Routing (returns IntentResult)
         intent_result: IntentResult = route_intent(user_input, session_id)
         intent = intent_result.intent
+
+        # 3. Intercept generic report-related or analysis-related requests for clarification
+        input_lower = user_input.lower().strip()
+        is_report_related = any(kw in input_lower for kw in ("report", "memo", "analysis", "synthesis", "pdf", "docx"))
+        
+        # Check if the user is asking about past/existing reports in history
+        is_history_query = False
+        check_keywords = {"past", "previous", "existing", "history", "stored", "saved", "have any", "any past", "list my", "what report", "see any"}
+        if is_report_related and any(kw in input_lower for kw in check_keywords):
+            is_history_query = True
+        elif any(dm in input_lower for dm in ("do you have a report", "do you have any reports", "are there any reports", "show past reports", "list reports", "what reports do we have")):
+            is_history_query = True
+
+        if is_history_query:
+            try:
+                from sessions.session_store import session_store
+                session = session_store.get(session_id)
+                user_id = session.user_identifier if session else "anonymous"
+                user_sessions = session_store.get_all_by_user(user_id) if user_id else []
+                
+                reports_found = []
+                for s in user_sessions:
+                    if s.last_pipeline_result and (s.last_pipeline_result.get("report") or s.last_pipeline_result.get("memo")):
+                        comp = s.last_pipeline_result.get("company_name", s.company_name or "Unknown Company")
+                        reports_found.append({
+                            "company_name": comp,
+                            "session_id": s.session_id,
+                            "rating": s.last_pipeline_result.get("rating"),
+                            "has_memo": bool(s.last_pipeline_result.get("memo")),
+                            "has_report": bool(s.last_pipeline_result.get("report")),
+                        })
+                
+                seen = set()
+                unique_reports = []
+                for r in reports_found:
+                    if r["company_name"] not in seen:
+                        seen.add(r["company_name"])
+                        unique_reports.append(r)
+                        
+                return OrchestratorResponse(
+                    content="",
+                    intent=intent,
+                    action_required="show_past_reports_list",
+                    data={
+                        "reports": unique_reports
+                    }
+                )
+            except Exception as exc:
+                logger.warning("Error checking history reports in orchestrator: %s", exc)
+
+        is_unclear = False
+        if is_report_related:
+            generic_words = {"give", "me", "i", "want", "show", "get", "download", "export", "view", "the", "as", "pdf", "docx", "report", "memo", "analysis", "synthesis", "final", "latest"}
+            words = set(input_lower.split())
+            if words.issubset(generic_words) or not intent_result.extracted_entity:
+                is_unclear = True
+        elif intent == UserIntent.FULL_PIPELINE.value and not intent_result.extracted_entity:
+            is_unclear = True
+
+        if is_unclear:
+            try:
+                from sessions.session_store import session_store
+                session = session_store.get(session_id)
+                user_id = session.user_identifier if session else "anonymous"
+                user_sessions = session_store.get_all_by_user(user_id) if user_id else []
+                
+                existing_company = ""
+                existing_session_id = ""
+                
+                # Check current session first
+                if session and session.last_pipeline_result and (session.last_pipeline_result.get("report") or session.last_pipeline_result.get("memo")):
+                    existing_company = session.last_pipeline_result.get("company_name", session.company_name or "the company")
+                    existing_session_id = session.session_id
+                else:
+                    # Check other sessions
+                    for s in user_sessions:
+                        if s.last_pipeline_result and (s.last_pipeline_result.get("report") or s.last_pipeline_result.get("memo")):
+                            existing_company = s.last_pipeline_result.get("company_name", s.company_name or "the company")
+                            existing_session_id = s.session_id
+                            break
+                            
+                if existing_company and existing_session_id:
+                    return OrchestratorResponse(
+                        content="",
+                        intent=intent,
+                        action_required="ask_report_clarification",
+                        data={
+                            "has_existing": True,
+                            "company_name": existing_company,
+                            "target_session_id": existing_session_id
+                        }
+                    )
+                else:
+                    return OrchestratorResponse(
+                        content="",
+                        intent=intent,
+                        action_required="ask_report_clarification",
+                        data={
+                            "has_existing": False
+                        }
+                    )
+            except Exception as exc:
+                logger.warning("Error checking for existing reports in orchestrator: %s", exc)
         
         # 4. Delegate based on intent
         if intent == UserIntent.FULL_PIPELINE.value:

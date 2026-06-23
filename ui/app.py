@@ -432,6 +432,7 @@ async def on_resume(thread):
     session = session_store.get_by_thread(thread_id, user_id)
     if session:
         cl.user_session.set("session", session)
+        cl.user_session.set("is_processing", False)  # always clear in-memory lock on load/resume
         
         # Hydrate memo and report if available to restore action buttons
         if session.last_pipeline_result:
@@ -465,6 +466,7 @@ async def on_resume(thread):
         # Thread exists in Chainlit but not in our session DB — create it
         session = session_store.create_new(thread_id, user_id)
         cl.user_session.set("session", session)
+        cl.user_session.set("is_processing", False)  # always clear in-memory lock on load/resume
         cl.user_session.set("memo_obj", None)
         cl.user_session.set("report_obj", None)
         logger.info("Re-created session record for thread %s user %s", thread_id[:8], user_id)
@@ -648,6 +650,88 @@ async def on_message(message: cl.Message):
 
         asyncio.ensure_future(_ingest_image_bg())
         return
+
+    elif action == "show_past_reports_list":
+        reports = response.data.get("reports", [])
+        if not reports:
+            await cl.Message(
+                content="📂 **No past generated reports found in your history.**\n\nYou can upload a document or start a new analysis to generate one.",
+                actions=[
+                    cl.Action(name="start_fresh", label="🗑 Start Fresh", payload={})
+                ]
+            ).send()
+        else:
+            lines = ["### 📂 Past Generated Reports Found:\n"]
+            actions = []
+            for i, r in enumerate(reports, 1):
+                comp = r["company_name"]
+                rating = f" (Rating: {r['rating']})" if r.get("rating") else ""
+                lines.append(f"**{i}.** {comp}{rating}")
+                
+                actions.append(cl.Action(
+                    name="retrieve_report",
+                    label=f"📁 View {comp}",
+                    payload={"target_session_id": r["session_id"], "company": comp}
+                ))
+            
+            await cl.Message(
+                content="\n".join(lines) + "\n\nWould you like to retrieve one of these reports?",
+                actions=actions
+            ).send()
+
+    elif action == "ask_report_clarification":
+        has_existing = response.data.get("has_existing", False)
+        if has_existing:
+            company = response.data.get("company_name", "your company")
+            target_session_id = response.data.get("target_session_id")
+            actions = [
+                cl.Action(
+                    name="retrieve_report",
+                    label="📁 View Previous Report",
+                    payload={"target_session_id": target_session_id, "company": company}
+                ),
+                cl.Action(
+                    name="run_new_analysis",
+                    label="🔍 Run New Analysis",
+                    payload={"company": company}
+                )
+            ]
+            await cl.Message(
+                content=(
+                    f"ℹ️ I found an existing research report for **{company}** in your history.\n\n"
+                    f"Would you like to retrieve that report, or run a new full analysis to generate a fresh one?"
+                ),
+                actions=actions
+            ).send()
+        else:
+            company = (session.company_name if session else "") or response.data.get("company_name") or ""
+            
+            actions = []
+            if company:
+                actions.append(
+                    cl.Action(
+                        name="run_new_analysis",
+                        label=f"🔍 Run Analysis for {company}",
+                        payload={"company": company}
+                    )
+                )
+            actions.append(
+                cl.Action(
+                    name="cancel_analysis",
+                    label="❌ Cancel",
+                    payload={}
+                )
+            )
+            
+            if company:
+                prompt_text = f"⚠️ **No previous report found for {company}.**\n\nWould you like to run a full analysis now?"
+            else:
+                prompt_text = "⚠️ **No previous report found in your history.**\n\nPlease specify a company to analyze (e.g. `Analyze Apple AAPL`) or upload a PDF first."
+                
+            await cl.Message(
+                content=prompt_text,
+                actions=actions
+            ).send()
 
     elif action == "trigger_chat_agent":
         skip_rag = response.data.get("skip_rag", False) if response.data else False
@@ -1454,6 +1538,79 @@ async def on_export_pdf(action):
 async def on_ask_questions(action):
     """Handle Ask Questions button click."""
     await cl.Message(content="Start typing your questions in the chat!").send()
+
+
+@cl.action_callback("retrieve_report")
+async def on_retrieve_report(action: cl.Action):
+    """Retrieve previous pipeline analysis results and load them into active session."""
+    target_session_id = action.payload.get("target_session_id")
+    company = action.payload.get("company", "the company")
+    
+    target_session = session_store.get(target_session_id)
+    if target_session and target_session.last_pipeline_result:
+        memo_data = target_session.last_pipeline_result.get("memo")
+        report_data = target_session.last_pipeline_result.get("report")
+        
+        from schemas.reports import InvestmentMemo, ResearchReport
+        if memo_data:
+            cl.user_session.set("memo_obj", InvestmentMemo(**memo_data))
+        else:
+            cl.user_session.set("memo_obj", None)
+            
+        if report_data:
+            cl.user_session.set("report_obj", ResearchReport(**report_data))
+        else:
+            cl.user_session.set("report_obj", None)
+            
+        ctx_parts = [f"Company: {company}"]
+        rating = target_session.last_pipeline_result.get("rating")
+        if rating:
+            ctx_parts.append(f"Rating: {rating}")
+        if memo_data:
+            ctx_parts.append(f"\n--- MEMO ---\n{memo_to_markdown(InvestmentMemo(**memo_data))}")
+            
+        current_session_id = cl.user_session.get("session_id")
+        store_pipeline_context(current_session_id, "\n".join(ctx_parts))
+        
+        current_session = cl.user_session.get("session")
+        if current_session:
+            current_session.company_name = company
+            current_session.last_pipeline_result = target_session.last_pipeline_result
+            current_session.pipeline_status = "done"
+            session_store.update(current_session)
+            
+        await cl.Message(content=f"✅ **Retrieved previous report for {company}**").send()
+        await show_pipeline_actions(company)
+    else:
+        await cl.Message(content="❌ Failed to retrieve previous report data.").send()
+
+
+@cl.action_callback("run_new_analysis")
+@with_processing_lock
+async def on_run_new_analysis(action: cl.Action):
+    """Run a new full research pipeline for a company from clarification flow."""
+    company_name = action.payload.get("company")
+    session_id = cl.user_session.get("session_id")
+    session = session_store.get(session_id) if session_id else None
+    
+    if not company_name:
+        await cl.Message(content="⚠️ No company specified. Please type your query (e.g. `Analyze JPMorgan`).").send()
+        return
+        
+    data = {
+        "company_name": company_name,
+        "ticker": "",
+        "query": f"Analyze the latest filings for {company_name}"
+    }
+    
+    await cl.Message(content=f"🚀 Starting full analysis for **{company_name}**...").send()
+    await _handle_pipeline(data, session_id, session)
+
+
+@cl.action_callback("cancel_analysis")
+async def on_cancel_analysis(action: cl.Action):
+    """Cancel clarification and prompt for a new query."""
+    await cl.Message(content="❌ Analysis cancelled. What else can I help you with?").send()
 
 
 @cl.action_callback("run_analysis")

@@ -38,6 +38,7 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=3.1.0",
     "markdown>=3.10.2",
     "matplotlib>=3.10.9",
+    "ngrok>=1.7.0",
     "nomic>=3.9.0",
     "numpy>=2.4.4",
     "openai>=2.36.0",
