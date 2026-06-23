@@ -48,13 +48,20 @@ def build_citations(docs: list[Document], session_id: str = "") -> list[Citation
         # Fallback for chunk_id if the retriever didn't pass the raw point ID
         chunk_id = metadata.get("chunk_id", str(hash(doc.page_content)))
         
-        # Truncate content for display and strict text extract
+        # Content fields:
+        #   full_text = parent content (used by LLM for broader context, spans pages)
+        #   child_text = child content (the actual retrieval unit, ~500 tokens,
+        #                precise to a single page — used for crop matching)
         full_text = doc.page_content.strip()
-        text_excerpt = full_text[:200]
-        chunk_preview = full_text[:150].replace("\n", " ")
+        child_text = metadata.get("child_content", "").strip() or full_text
+        text_excerpt = child_text[:200]
+        chunk_preview = child_text[:350].replace("\n", " ")
         
-        # Relevance score (if provided by HybridRetriever)
-        confidence = metadata.get("score", 0.0)
+        # Relevance scores — use dense_score (cosine similarity, 0–1) for display;
+        # RRF scores (0.015–0.016 range) are meaningless to end users
+        rrf_score = metadata.get("score", 0.0)
+        dense_score = metadata.get("dense_score", 0.0)
+        confidence = dense_score if dense_score and dense_score > 0 else rrf_score
         
         # Image fields
         image_url = None
@@ -77,7 +84,11 @@ def build_citations(docs: list[Document], session_id: str = "") -> list[Citation
             if not os.path.isabs(local_path):
                 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
                 local_path = os.path.join(project_root, local_path)
-            crop_path = extract_chunk_crop(local_path, page_num, full_text, session_id)
+            # Use child_text for crop matching — it's more focused and maps
+            # precisely to the chunk's page, unlike parent_content which spans pages
+            crop_path = extract_chunk_crop(
+                local_path, page_num, child_text, session_id, chunk_id=chunk_id
+            )
             if crop_path:
                 image_url = crop_path
                 image_type = "pdf_crop"
@@ -91,11 +102,12 @@ def build_citations(docs: list[Document], session_id: str = "") -> list[Citation
             section=section,
             chunk_id=chunk_id,
             confidence=confidence,
+            dense_score=dense_score,
             chunk_preview=chunk_preview,
             has_image=has_image,
             image_url=image_url,
             image_description=image_description,
-            image_type=image_type
+            image_type=image_type,
         )
         
         citations.append(citation)

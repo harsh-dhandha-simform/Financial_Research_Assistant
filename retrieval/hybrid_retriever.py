@@ -144,7 +144,7 @@ class HybridRetriever:
         Returns:
             RetrievalResult with fused chunks and context_text ready for LLM.
         """
-        candidate_k = top_k * 2
+        candidate_k = max(top_k * 3, 18)  # 3× candidates for better RRF coverage
         dense_k = dense_top_k or candidate_k
         sparse_k = sparse_top_k or candidate_k
 

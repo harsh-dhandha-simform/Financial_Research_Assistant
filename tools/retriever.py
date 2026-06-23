@@ -71,6 +71,36 @@ def rebuild_bm25_index(collection_name: str):
         logger.warning("Failed to rebuild BM25 index for '%s': %s", collection_name, exc)
 
 
+def prewarm_bm25_for_user(user_id: str) -> None:
+    """Eagerly initialize the hybrid retriever (including BM25) for a user's collection.
+
+    Called at session start so BM25 is ready before the first query.
+    Safe to call multiple times — subsequent calls are no-ops (cached).
+
+    Args:
+        user_id: The user identifier used to derive the collection name.
+    """
+    if not user_id:
+        return
+    try:
+        from sessions.session_store import session_store
+        collection_name = session_store.get_user_collection(user_id)
+        hybrid = _get_hybrid(collection_name)
+        if not hybrid.bm25_retriever.is_ready:
+            count = hybrid.bm25_retriever.build_from_qdrant(
+                hybrid.qdrant_store.client, collection_name
+            )
+            logger.info(
+                "BM25 pre-warmed for user '%s' (collection '%s'): %d chunks",
+                user_id, collection_name, count,
+            )
+        else:
+            logger.debug("BM25 already ready for collection '%s' — skipping prewarm", collection_name)
+    except Exception as exc:
+        logger.warning("BM25 prewarm failed for user '%s': %s", user_id, exc)
+
+
+
 from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import InjectedToolArg
 from typing import Annotated
@@ -153,6 +183,9 @@ def rag_retriever(
             "score": chunk.rrf_score,
             "dense_score": chunk.dense_score,
             "sparse_score": chunk.sparse_score,
+            # Child content (the actual retrieval unit, ~500 tokens) is more
+            # precise for image crops than the larger parent_content.
+            "child_content": chunk.content,
         }
         # Include stored metadata (source_document, page, company_name, etc.)
         if chunk.metadata:
@@ -163,6 +196,7 @@ def rag_retriever(
             metadata=doc_metadata,
         )
         documents.append(doc)
+
 
     logger.info(
         "rag_retriever: query='%s' section=%s top_k=%d → %d docs",

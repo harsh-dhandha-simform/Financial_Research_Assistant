@@ -32,6 +32,7 @@ chainlit_app.include_router(signup_router)
 num_new_routes = len(signup_router.routes)
 chainlit_app.router.routes = chainlit_app.router.routes[-num_new_routes:] + chainlit_app.router.routes[:-num_new_routes]
 
+
 from chat.agent import chat, store_pipeline_context, clear_session
 from core.orchestrator import UnifiedOrchestrator, OrchestratorResponse
 from core.intent_router import UserIntent
@@ -53,6 +54,7 @@ from ui.components import show_welcome, show_scoped_sources, show_global_sources
 from graph.workflow import build_research_graph
 from graph.state import ResearchState
 from agents.base import create_langfuse_config
+from tools.retriever import prewarm_bm25_for_user
 import ui.auth  # Registers @cl.password_auth_callback
 
 logger = logging.getLogger(__name__)
@@ -344,6 +346,16 @@ async def on_start():
             cl.user_session.set("report_obj", None)
             
         logger.info("Loaded existing session %s for user %s", thread_id[:8], user_id)
+
+        # Pre-warm BM25 index in background so hybrid retrieval works immediately
+        import threading
+        threading.Thread(
+            target=prewarm_bm25_for_user,
+            args=(user_id,),
+            daemon=True,
+            name=f"bm25-prewarm-{user_id[:8]}",
+        ).start()
+
         await show_welcome(session, is_fresh=False)  # Returning to existing thread
         
         # If pipeline results exist, immediately show the action buttons
@@ -366,6 +378,16 @@ async def on_start():
         cl.user_session.set("session", session)
         cl.user_session.set("memo_obj", None)
         cl.user_session.set("report_obj", None)
+
+        # Pre-warm BM25 index in background
+        import threading
+        threading.Thread(
+            target=prewarm_bm25_for_user,
+            args=(user_id,),
+            daemon=True,
+            name=f"bm25-prewarm-{user_id[:8]}",
+        ).start()
+
         await show_welcome(session, is_fresh=True)  # Brand new thread
 
 
@@ -547,13 +569,85 @@ async def on_message(message: cl.Message):
 
 
     elif action == "trigger_pdf_ingestion":
-        await _handle_pdf_upload_action(response.data, session_id, session)
+        from chainlit.context import context_var
+        _cl_context = context_var.get()
+        _data = response.data
+        _session_id = session_id
+        _session = session
+
+        async def _ingest_pdf_bg():
+            token = context_var.set(_cl_context)
+            try:
+                await _handle_pdf_upload_action(_data, _session_id, _session)
+            except Exception as exc:
+                logger.exception("Background PDF ingestion failed: %s", exc)
+                try:
+                    await cl.Message(content=f"❌ **Ingestion failed:** {_format_error(exc)}").send()
+                except Exception:
+                    pass
+            finally:
+                context_var.reset(token)
+                try:
+                    cl.user_session.set("is_processing", False)
+                except Exception:
+                    pass
+
+        asyncio.ensure_future(_ingest_pdf_bg())
+        return
 
     elif action == "trigger_url_ingestion":
-        await _handle_url_ingestion_action(response.data, session_id, session)
+        from chainlit.context import context_var
+        _cl_context = context_var.get()
+        _data = response.data
+        _session_id = session_id
+        _session = session
+
+        async def _ingest_url_bg():
+            token = context_var.set(_cl_context)
+            try:
+                await _handle_url_ingestion_action(_data, _session_id, _session)
+            except Exception as exc:
+                logger.exception("Background URL ingestion failed: %s", exc)
+                try:
+                    await cl.Message(content=f"❌ **Ingestion failed:** {_format_error(exc)}").send()
+                except Exception:
+                    pass
+            finally:
+                context_var.reset(token)
+                try:
+                    cl.user_session.set("is_processing", False)
+                except Exception:
+                    pass
+
+        asyncio.ensure_future(_ingest_url_bg())
+        return
 
     elif action == "trigger_image_ingestion":
-        await _handle_image_upload_action(response.data, session_id, session)
+        from chainlit.context import context_var
+        _cl_context = context_var.get()
+        _data = response.data
+        _session_id = session_id
+        _session = session
+
+        async def _ingest_image_bg():
+            token = context_var.set(_cl_context)
+            try:
+                await _handle_image_upload_action(_data, _session_id, _session)
+            except Exception as exc:
+                logger.exception("Background Image ingestion failed: %s", exc)
+                try:
+                    await cl.Message(content=f"❌ **Ingestion failed:** {_format_error(exc)}").send()
+                except Exception:
+                    pass
+            finally:
+                context_var.reset(token)
+                try:
+                    cl.user_session.set("is_processing", False)
+                except Exception:
+                    pass
+
+        asyncio.ensure_future(_ingest_image_bg())
+        return
 
     elif action == "trigger_chat_agent":
         skip_rag = response.data.get("skip_rag", False) if response.data else False
@@ -852,7 +946,8 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
         with open(file_path, "rb") as f:
             file_bytes = f.read()
 
-        raw_doc = ingest_pdf(
+        raw_doc = await asyncio.to_thread(
+            ingest_pdf,
             file_bytes=file_bytes,
             file_name=filename,
             company_name=company_name,
@@ -885,14 +980,28 @@ async def _handle_pdf_upload_action(data: dict, session_id: str, session: UserSe
         await cl.Message(content=f"🧠 Identified Company: **{company_name}** {f'({session.ticker})' if session and session.ticker else ''}. Chunking & storing...").send()
 
         logger.info("[Ingest PDF] Storing in collection %s for user %s", collection_name, user_id)
-        stats = _chunk_and_store(raw_doc, collection_name, user_id=user_id)
+        stats = await asyncio.to_thread(
+            _chunk_and_store,
+            raw_doc,
+            collection_name,
+            user_id=user_id,
+        )
         
         # Extract all embedded images from the PDF
-        extracted_images = extract_images_from_pdf(file_path, session_id)
+        extracted_images = await asyncio.to_thread(
+            extract_images_from_pdf,
+            file_path,
+            session_id,
+        )
         images = extracted_images if extracted_images else []
         
         # Extract preview of page 1
-        preview_path = extract_page_image(file_path, 1, session_id)
+        preview_path = await asyncio.to_thread(
+            extract_page_image,
+            file_path,
+            1,
+            session_id,
+        )
         if preview_path:
             images.append({
                 "path": preview_path,
@@ -970,7 +1079,7 @@ async def _handle_url_ingestion_action(data: dict, session_id: str, session: Use
 
     try:
         company_name = session.company_name if session else "Unknown"
-        raw_doc = ingest_url(url=url, company_name=company_name)
+        raw_doc = await asyncio.to_thread(ingest_url, url=url, company_name=company_name)
 
         await cl.Message(content=f"📄 Extracted **{len(raw_doc.pages)} pages**...").send()
         
@@ -995,7 +1104,12 @@ async def _handle_url_ingestion_action(data: dict, session_id: str, session: Use
         await cl.Message(content=f"🧠 Identified Company: **{company_name}** {f'({session.ticker})' if session and session.ticker else ''}. Chunking & storing...").send()
 
         logger.info("[Ingest URL] Storing in collection %s for user %s", collection_name, user_id)
-        stats = _chunk_and_store(raw_doc, collection_name, user_id=user_id)
+        stats = await asyncio.to_thread(
+            _chunk_and_store,
+            raw_doc,
+            collection_name,
+            user_id=user_id,
+        )
 
         # Store document metadata — use raw_doc.doc_id so Qdrant filter matches on delete
         from datetime import datetime
@@ -1134,7 +1248,12 @@ async def _handle_image_upload_action(data: dict, session_id: str, session: User
         ).send()
 
         logger.info("[Ingest Image] Storing in collection %s for user %s", collection_name, user_id)
-        stats = _chunk_and_store(raw_doc, collection_name, user_id=user_id)
+        stats = await asyncio.to_thread(
+            _chunk_and_store,
+            raw_doc,
+            collection_name,
+            user_id=user_id,
+        )
 
         # Store document metadata
         doc_meta = {
@@ -1248,6 +1367,8 @@ async def _handle_chat(question: str, session_id: str, skip_rag: bool = False):
         if response.sources and response.relevant:
             from ui.renderers.source_renderer import render_sources
             await render_sources(response.sources)
+            # Store citations so the "View Sources" button can re-render them
+            cl.user_session.set("last_sources", response.sources)
 
         # Per-message footer bar (Change 12)
         await cl.Message(
@@ -1255,7 +1376,7 @@ async def _handle_chat(question: str, session_id: str, skip_rag: bool = False):
             actions=[
                 cl.Action(name="thumbs_up",   label="👍", payload={"value": "up", "question": question[:100]}),
                 cl.Action(name="thumbs_down", label="👎", payload={"value": "down", "question": question[:100]}),
-                cl.Action(name="copy_msg",    label="📋 Copy", payload={"value": answer[:200]}),
+                cl.Action(name="copy_msg",    label="📋 Copy", payload={"value": answer[:3000]}),
                 cl.Action(name="regenerate",  label="🔄 Regenerate", payload={"value": "regen", "question": question}),
             ]
         ).send()
@@ -1264,8 +1385,9 @@ async def _handle_chat(question: str, session_id: str, skip_rag: bool = False):
         session: UserSession = cl.user_session.get("session")
         if session:
             session.chat_history.append({"role": "user", "content": question})
-            session.chat_history.append({"role": "assistant", "content": answer[:500]})
-            session.trim_chat_history()
+            # Store up to 1500 chars of each answer for better context recall
+            session.chat_history.append({"role": "assistant", "content": answer[:1500]})
+            session.trim_chat_history(max_turns=15)  # Keep 15 turns = 30 messages
             session_store.update(session)
 
     except Exception as exc:
@@ -1494,9 +1616,41 @@ async def on_thumbs_down(action):
     await cl.Message(content="👎 Sorry about that. I'll try to improve.").send()
 
 
+@cl.action_callback("open_sources_sidebar")
+async def on_open_sources_sidebar(action):
+    """Re-render the full sources message from the last stored citations.
+
+    When the user closes the sidebar or scrolls away, clicking "View Sources"
+    sends a fresh sources message with all clickable chips and inline images.
+    Each source chip opens the sidebar with full text details.
+    """
+    from ui.renderers.source_renderer import render_sources
+
+    last_sources = cl.user_session.get("last_sources")
+    if last_sources:
+        await cl.Message(content="📎 **Reopening sources for your last answer...**").send()
+        await render_sources(last_sources)
+    else:
+        await cl.Message(content="⚠️ No sources available — ask a question first to retrieve documents.").send()
+
+
 @cl.action_callback("copy_msg")
 async def on_copy_msg(action):
-    await cl.Message(content="📋 Answer copied to clipboard.").send()
+    """Copy the answer text to the user's clipboard via browser JavaScript."""
+    payload = action.payload if isinstance(action.payload, dict) else {}
+    text_to_copy = payload.get("value", "")
+    if text_to_copy:
+        # Escape backticks and backslashes for safe JS string embedding
+        safe_text = text_to_copy.replace("\\", "\\\\").replace("`", "\\`")
+        try:
+            await cl.run_javascript(
+                f"navigator.clipboard.writeText(`{safe_text}`)"
+                f".then(() => console.log('Copied to clipboard'))"
+                f".catch(err => console.error('Clipboard error:', err));"
+            )
+        except Exception:
+            pass  # run_javascript may not be available in all Chainlit versions
+    await cl.Message(content="📋 Answer copied to clipboard!").send()
 
 
 @cl.action_callback("regenerate")

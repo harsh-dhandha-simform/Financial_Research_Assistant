@@ -248,6 +248,23 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "429" in exc_str or "rate limit" in exc_str or "rate_limit" in exc_str
 
 
+def _is_overloaded_error(exc: Exception) -> bool:
+    """Check if an exception is a 503 model-overloaded / high-demand error.
+
+    Google Gemini returns 503 UNAVAILABLE when the model is experiencing high
+    demand. This is transient and should trigger an immediate fallback to the
+    next model, exactly like a 429 rate limit.
+    """
+    exc_str = str(exc).lower()
+    return (
+        "503" in exc_str
+        or "unavailable" in exc_str
+        or "high demand" in exc_str
+        or "overloaded" in exc_str
+        or "service unavailable" in exc_str
+    )
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     """Check if an exception is a timeout error."""
     exc_str = str(exc).lower()
@@ -259,10 +276,17 @@ def _is_json_error(exc: Exception) -> bool:
     return isinstance(exc, (ValidationError, ValueError)) or "json" in str(exc).lower()
 
 
+def _is_transient_error(exc: Exception) -> bool:
+    """Check if an error is transient (should trigger fallback / key rotation)."""
+    return _is_rate_limit_error(exc) or _is_overloaded_error(exc) or _is_timeout_error(exc)
+
+
 def _classify_error(exc: Exception) -> str:
     """Classify an error for logging purposes."""
     if _is_rate_limit_error(exc):
         return "RATE_LIMIT_429"
+    if _is_overloaded_error(exc):
+        return "OVERLOADED_503"
     if _is_timeout_error(exc):
         return "TIMEOUT"
     if _is_json_error(exc):
@@ -293,10 +317,13 @@ def _create_llm(config: ModelConfig) -> ChatOpenAI:
     if config.provider == "google":
         kwargs["max_retries"] = 0
 
-    # For groq/compound, pass its required compound_custom config
+    # For groq/compound, pass its required compound_custom config in extra_body
+    # to avoid TypeError in the OpenAI client.
     if config.model_id == "groq/compound":
         kwargs["model_kwargs"] = {
-            "compound_custom": {"tools": {"enabled_tools": ["web_search", "wolfram_aplha", "visit_website"]}}
+            "extra_body": {
+                "compound_custom": {"tools": {"enabled_tools": ["web_search", "wolfram_alpha", "visit_website"]}}
+            }
         }
 
     return ChatOpenAI(**kwargs)

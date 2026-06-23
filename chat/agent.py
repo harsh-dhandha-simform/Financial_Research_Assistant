@@ -30,6 +30,8 @@ from langchain_core.messages import (
 from langchain_core.documents import Document
 
 from agents.base import get_llm, create_langfuse_config
+from config import settings
+
 from tools.retriever import rag_retriever
 from tools.chat.query_rewriter import query_rewriter
 from tools.chat.citation_builder import build_citations
@@ -47,12 +49,17 @@ SEC filings, financial metrics, risk factors, and market sentiment for companies
 they have analysed.
 
 RULES:
-1. Answer ONLY based on the provided context (retrieved documents and pipeline results).
-2. If the context doesn't contain enough information, say so clearly.
-3. Cite specific numbers, dates, and sections from the filings.
-4. Be concise and professional — use bullet points for complex answers.
-5. If the user asks about the analysis report/memo, use the pipeline context.
-6. Never make up financial data — say "I don't have that data" if unsure.
+1. Answer based on the provided context (retrieved documents and pipeline results).
+2. You also have access to the FULL conversation history above — use it to:
+   - Answer meta-questions like "what did I ask before?" or "summarise our chat"
+   - Resolve what 'it', 'they', 'the company' refers to
+   - Provide continuity across questions
+3. If the context doesn’t contain enough information AND chat history doesn’t help, say so.
+4. Cite specific numbers, dates, and sections from the filings.
+5. Be concise and professional — use bullet points for complex answers.
+6. If the user asks about the analysis report/memo, use the pipeline context.
+7. Never make up financial data — say "I don’t have that data" if unsure.
+8. For questions about what was previously asked/said, look at the conversation history messages above.
 
 If pipeline results are available, you can reference them directly to answer \
 questions about the overall rating, thesis, risks, metrics, and recommendations."""
@@ -77,11 +84,11 @@ def clear_session(session_id: str):
 def _format_chat_history(messages: list) -> str:
     """Format message history for the query rewriter."""
     lines = []
-    for msg in messages[-10:]:  # Last 10 messages for context window
+    for msg in messages[-20:]:  # Last 20 messages (10 turns) for context window
         if isinstance(msg, HumanMessage):
             lines.append(f"User: {msg.content}")
         elif isinstance(msg, AIMessage):
-            lines.append(f"Assistant: {msg.content[:200]}")
+            lines.append(f"Assistant: {msg.content[:300]}")
     return "\n".join(lines)
 
 
@@ -162,7 +169,7 @@ def chat(
         history = []
 
     langchain_history = []
-    safe_history = [m for m in history[-12:] if isinstance(m, dict)]
+    safe_history = [m for m in history[-30:] if isinstance(m, dict)]  # last 15 turns
     for msg in safe_history:
         if isinstance(msg, dict):
             role = msg.get("role")
@@ -209,8 +216,8 @@ def chat(
         SystemMessage(content=CHAT_SYSTEM_PROMPT),
     ]
 
-    # Add conversation history (last 6 turns for context window)
-    for msg in langchain_history[-12:]:
+    # Add conversation history (last 15 turns for context window)
+    for msg in langchain_history[-30:]:
         messages.append(msg)
 
     # Build the user message with context
@@ -232,8 +239,12 @@ def chat(
 
     messages.append(HumanMessage(content=user_msg))
 
-    from config import settings
-    from agents.base import _is_rate_limit_error, _rotate_google_key
+    from agents.base import (
+        AGENT_MODELS, _create_llm, _get_api_key,
+        _is_rate_limit_error, _is_overloaded_error,
+        _rotate_google_key, _classify_error,
+    )
+
 
     config = create_langfuse_config(
         session_id=session_id,
@@ -241,27 +252,77 @@ def chat(
         use_callbacks=True,
     )
 
-    max_attempts = len(settings.google_api_keys) if settings.google_api_keys else 1
+    # ── Fallback chain: try each model in AGENT_MODELS["news"] in order ──────
+    # Any error (429, 503, timeout, connection error) moves to the next model.
+    # For Google models: 429 → rotate API key first and retry same model once
+    # before falling through. 503 (UNAVAILABLE) goes straight to next model.
+    model_configs = AGENT_MODELS.get("news", [])
     answer = ""
+    last_error: Exception | None = None
 
-    for attempt in range(max_attempts):
-        llm = get_llm("news")  # Re-fetch LLM to get updated API key if rotated
-        try:
-            response = llm.invoke(messages, config=config)
-            answer = response.content
-            break
-        except Exception as exc:
-            if _is_rate_limit_error(exc) and attempt < max_attempts - 1:
-                logger.warning("Chat agent rate limit (429) on attempt %d. Rotating Google API key...", attempt + 1)
-                _rotate_google_key()
-                continue
+    for i, model_config in enumerate(model_configs):
+        label = "primary" if i == 0 else f"fallback-{i}"
 
-            logger.error("Chat LLM failed: %s", exc)
-            answer = (
-                "I'm sorry, I encountered an error while generating a response. "
-                "Please try again or rephrase your question."
-            )
-            break
+        # Google: try all available API keys before giving up on this model
+        google_key_attempts = (
+            len(settings.google_api_keys) if model_config.provider == "google" else 1
+        )
+
+        for key_attempt in range(google_key_attempts):
+            api_key = _get_api_key(model_config.provider)
+            if not api_key:
+                logger.warning(
+                    "Chat agent [%s]: no API key for %s — skipping",
+                    label, model_config.provider,
+                )
+                break  # No key → skip this model entirely
+
+            try:
+                llm = _create_llm(model_config)
+                response = llm.invoke(messages, config=config)
+                answer = response.content
+                logger.info(
+                    "Chat agent [%s]: ✅ answered via %s",
+                    label, model_config.model_id,
+                )
+                break  # Success — stop key/model iteration
+
+            except Exception as exc:
+                error_type = _classify_error(exc)
+                last_error = exc
+
+                # Google 429 (rate limit): rotate key and retry same model.
+                # Google 503 (overloaded): key rotation won't help — skip to next model.
+                if (
+                    model_config.provider == "google"
+                    and _is_rate_limit_error(exc)
+                    and not _is_overloaded_error(exc)
+                    and key_attempt < google_key_attempts - 1
+                ):
+                    logger.warning(
+                        "Chat agent [%s]: ❌ rate limit (429) on key %d/%d for %s — rotating key",
+                        label, key_attempt + 1, google_key_attempts, model_config.model_id,
+                    )
+                    _rotate_google_key()
+                    continue  # retry with next Google key
+
+                # Any other error (503, timeout, connection, etc.): fall through to next model
+                logger.warning(
+                    "Chat agent [%s]: ❌ %s from %s — trying next model. Error: %s",
+                    label, error_type, model_config.model_id, str(exc)[:200],
+                )
+                break  # Exit key-attempt loop → outer loop tries next model
+
+        if answer:
+            break  # Got an answer — exit model loop
+
+
+    if not answer:
+        logger.error("Chat agent: all models failed. Last error: %s", last_error)
+        answer = (
+            "I'm sorry, I encountered an error generating a response. "
+            "Please try again in a moment."
+        )
 
     # ── 5. Update session history ────────────────────────────────────
     history.append(HumanMessage(content=question))
