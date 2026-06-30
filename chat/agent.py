@@ -17,6 +17,7 @@ without re-running agents.
 Short-term memory: LangChain message history stored per session_id.
 """
 
+_sessions: dict[str, list] = {}
 import logging
 import uuid
 from typing import Any
@@ -29,16 +30,15 @@ from langchain_core.messages import (
 from langchain_core.documents import Document
 
 from agents.base import get_llm, create_langfuse_config
+from config import settings
+
 from tools.retriever import rag_retriever
 from tools.chat.query_rewriter import query_rewriter
+from tools.chat.citation_builder import build_citations
 from schemas.chat import ChatResponse
 
 logger = logging.getLogger(__name__)
 
-
-# ── Short-term memory: session_id → message history ─────────────────────────
-# In production, swap this for Redis or PostgresSaver.
-_sessions: dict[str, list] = {}
 
 # ── Pipeline result cache: session_id → ResearchState summary ────────────────
 _pipeline_context: dict[str, str] = {}
@@ -49,12 +49,17 @@ SEC filings, financial metrics, risk factors, and market sentiment for companies
 they have analysed.
 
 RULES:
-1. Answer ONLY based on the provided context (retrieved documents and pipeline results).
-2. If the context doesn't contain enough information, say so clearly.
-3. Cite specific numbers, dates, and sections from the filings.
-4. Be concise and professional — use bullet points for complex answers.
-5. If the user asks about the analysis report/memo, use the pipeline context.
-6. Never make up financial data — say "I don't have that data" if unsure.
+1. Answer based on the provided context (retrieved documents and pipeline results).
+2. You also have access to the FULL conversation history above — use it to:
+   - Answer meta-questions like "what did I ask before?" or "summarise our chat"
+   - Resolve what 'it', 'they', 'the company' refers to
+   - Provide continuity across questions
+3. If the context doesn’t contain enough information AND chat history doesn’t help, say so.
+4. Cite specific numbers, dates, and sections from the filings.
+5. Be concise and professional — use bullet points for complex answers.
+6. If the user asks about the analysis report/memo, use the pipeline context.
+7. Never make up financial data — say "I don’t have that data" if unsure.
+8. For questions about what was previously asked/said, look at the conversation history messages above.
 
 If pipeline results are available, you can reference them directly to answer \
 questions about the overall rating, thesis, risks, metrics, and recommendations."""
@@ -70,16 +75,8 @@ def store_pipeline_context(session_id: str, context: str):
     logger.info("Stored pipeline context for session '%s' (%d chars)", session_id, len(context))
 
 
-def get_session_history(session_id: str) -> list:
-    """Get or create message history for a session."""
-    if session_id not in _sessions:
-        _sessions[session_id] = []
-    return _sessions[session_id]
-
-
 def clear_session(session_id: str):
     """Clear a session's message history."""
-    _sessions.pop(session_id, None)
     _pipeline_context.pop(session_id, None)
     logger.info("Cleared session '%s'", session_id)
 
@@ -87,42 +84,50 @@ def clear_session(session_id: str):
 def _format_chat_history(messages: list) -> str:
     """Format message history for the query rewriter."""
     lines = []
-    for msg in messages[-10:]:  # Last 10 messages for context window
+    for msg in messages[-20:]:  # Last 20 messages (10 turns) for context window
         if isinstance(msg, HumanMessage):
             lines.append(f"User: {msg.content}")
         elif isinstance(msg, AIMessage):
-            lines.append(f"Assistant: {msg.content[:200]}")
+            lines.append(f"Assistant: {msg.content[:300]}")
     return "\n".join(lines)
 
 
-def _retrieve_context(query: str, section_filter: str = "", top_k: int = 6) -> tuple[str, list[str]]:
+def _retrieve_context(query: str, section_filter: str = "", top_k: int = 6, session_id: str = "", user_id: str = "") -> tuple[str, list]:
     """Retrieve relevant document chunks.
 
     Returns:
-        Tuple of (formatted context string, list of source descriptions).
+        Tuple of (formatted context string, list of Citation objects).
     """
     try:
-        docs = rag_retriever.invoke({
-            "query": query,
-            "section_filter": section_filter,
-            "top_k": top_k,
-        })
+        docs = rag_retriever.invoke(
+            {
+                "query": query,
+                "section_filter": section_filter,
+                "top_k": top_k,
+            },
+            config={"configurable": {"session_id": session_id, "user_id": user_id}},
+        )
 
         if not docs:
             return "", []
 
+        # Build formal citations so Pydantic validation passes
+        citations = build_citations(docs, session_id)
+        
         context_parts = []
-        sources = []
         for i, doc in enumerate(docs):
-            section = doc.metadata.get("section", "unknown")
-            score = doc.metadata.get("score", 0)
+            if isinstance(doc.metadata, dict):
+                section = doc.metadata.get("section", "unknown")
+                score = doc.metadata.get("score", 0)
+            else:
+                section = "unknown"
+                score = 0
             context_parts.append(
                 f"[Source {i+1} | Section: {section} | Relevance: {score:.3f}]\n"
                 f"{doc.page_content}\n"
             )
-            sources.append(f"Section: {section} (score: {score:.3f})")
 
-        return "\n---\n".join(context_parts), sources
+        return "\n---\n".join(context_parts), citations
 
     except Exception as exc:
         logger.warning("RAG retrieval failed: %s", exc)
@@ -134,6 +139,9 @@ def chat(
     session_id: str = "",
     section_filter: str = "",
     top_k: int = 6,
+    user_id: str = "",
+    skip_rag: bool = False,
+    history: list[dict] = None,
 ) -> ChatResponse:
     """Process a chat question with RAG retrieval and conversation memory.
 
@@ -157,10 +165,25 @@ def chat(
     if not session_id:
         session_id = f"chat-{uuid.uuid4().hex[:8]}"
 
-    history = get_session_history(session_id)
+    if not isinstance(history, list):
+        history = []
+
+    langchain_history = []
+    safe_history = [m for m in history[-30:] if isinstance(m, dict)]  # last 15 turns
+    for msg in safe_history:
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "user":
+                langchain_history.append(HumanMessage(content=content))
+            elif role == "assistant":
+                langchain_history.append(AIMessage(content=content))
+        elif hasattr(msg, "type"):
+            # It's already a LangChain message (or similar)
+            langchain_history.append(msg)
 
     # ── 1. Query rewriting (resolve pronouns using history) ──────────
-    chat_history_str = _format_chat_history(history)
+    chat_history_str = _format_chat_history(langchain_history)
     try:
         rewritten = query_rewriter.invoke({
             "question": question,
@@ -172,10 +195,13 @@ def chat(
     logger.info("Chat query: '%s' → rewritten: '%s'", question[:60], rewritten[:60])
 
     # ── 2. RAG retrieval ─────────────────────────────────────────────
-    rag_context, sources = _retrieve_context(rewritten, section_filter, top_k)
+    if not skip_rag:
+        rag_context, sources = _retrieve_context(rewritten, section_filter, top_k, session_id, user_id)
+    else:
+        rag_context, sources = "", []
 
     # ── 3. Include pipeline context if available ─────────────────────
-    pipeline_ctx = _pipeline_context.get(session_id, "")
+    pipeline_ctx = _pipeline_context.get(session_id, "") if isinstance(_pipeline_context, dict) else ""
     full_context = ""
     if pipeline_ctx:
         full_context += f"=== PIPELINE ANALYSIS RESULTS ===\n{pipeline_ctx}\n\n"
@@ -185,14 +211,13 @@ def chat(
     relevant = bool(rag_context or pipeline_ctx)
 
     # ── 4. Generate answer ───────────────────────────────────────────
-    llm = get_llm("news")  # Fast model for chat
 
     messages = [
         SystemMessage(content=CHAT_SYSTEM_PROMPT),
     ]
 
-    # Add conversation history (last 6 turns for context window)
-    for msg in history[-12:]:
+    # Add conversation history (last 5 turns for context window)
+    for msg in langchain_history[-10:]:
         messages.append(msg)
 
     # Build the user message with context
@@ -201,6 +226,9 @@ def chat(
             f"Context:\n{full_context}\n\n"
             f"Question: {question}"
         )
+    elif skip_rag:
+        # Conversational / chitchat queries that don't need context
+        user_msg = f"Question: {question}"
     else:
         user_msg = (
             f"No relevant documents found for this query. "
@@ -211,28 +239,114 @@ def chat(
 
     messages.append(HumanMessage(content=user_msg))
 
+    from agents.base import (
+        AGENT_MODELS, _create_llm, _get_api_key,
+        _is_rate_limit_error, _is_overloaded_error,
+        _rotate_google_key, _classify_error,
+    )
+
+
     config = create_langfuse_config(
         session_id=session_id,
         trace_name="chat-agent",
+        use_callbacks=True,
     )
 
-    try:
-        response = llm.invoke(messages, config=config)
-        answer = response.content
-    except Exception as exc:
-        logger.error("Chat LLM failed: %s", exc)
+    # ── Fallback chain: try each model in AGENT_MODELS["news"] in order ──────
+    # Any error (429, 503, timeout, connection error) moves to the next model.
+    # For Google models: 429 → rotate API key first and retry same model once
+    # before falling through. 503 (UNAVAILABLE) goes straight to next model.
+    # If all models fail, we rotate the Google API key and retry the entire chain once.
+    model_configs = AGENT_MODELS.get("news", [])
+    answer = ""
+    last_error: Exception | None = None
+
+    # Try up to 2 full cycles of the model fallback chain
+    for cycle in range(2):
+        if cycle > 0:
+            logger.info("Chat agent [cycle %d]: Retrying model chain after Google API key rotation", cycle)
+
+        for i, model_config in enumerate(model_configs):
+            label = "primary" if i == 0 else f"fallback-{i}"
+            if cycle > 0:
+                label += f"-cycle{cycle}"
+
+            # Google: try all available API keys before giving up on this model
+            google_key_attempts = (
+                len(settings.google_api_keys) if model_config.provider == "google" else 1
+            )
+
+            for key_attempt in range(google_key_attempts):
+                api_key = _get_api_key(model_config.provider)
+                if not api_key:
+                    logger.warning(
+                        "Chat agent [%s]: no API key for %s — skipping",
+                        label, model_config.provider,
+                    )
+                    break  # No key → skip this model entirely
+
+                try:
+                    llm = _create_llm(model_config)
+                    response = llm.invoke(messages, config=config)
+                    answer = response.content
+                    logger.info(
+                        "Chat agent [%s]: ✅ answered via %s",
+                        label, model_config.model_id,
+                    )
+                    break  # Success — stop key/model iteration
+
+                except Exception as exc:
+                    error_type = _classify_error(exc)
+                    last_error = exc
+
+                    # Google 429 (rate limit): rotate key and retry same model.
+                    # Google 503 (overloaded): key rotation won't help — skip to next model.
+                    if (
+                        model_config.provider == "google"
+                        and _is_rate_limit_error(exc)
+                        and not _is_overloaded_error(exc)
+                        and key_attempt < google_key_attempts - 1
+                    ):
+                        logger.warning(
+                            "Chat agent [%s]: ❌ rate limit (429) on key %d/%d for %s — rotating key",
+                            label, key_attempt + 1, google_key_attempts, model_config.model_id,
+                        )
+                        _rotate_google_key()
+                        continue  # retry with next Google key
+
+                    # Any other error (503, timeout, connection, etc.): fall through to next model
+                    logger.warning(
+                        "Chat agent [%s]: ❌ %s from %s — trying next model. Error: %s",
+                        label, error_type, model_config.model_id, str(exc)[:200],
+                    )
+                    break  # Exit key-attempt loop → outer loop tries next model
+
+            if answer:
+                break  # Got an answer — exit model loop
+
+        if answer:
+            break  # Got an answer — exit cycle loop
+        else:
+            # If all fallback models failed in the first cycle, rotate Google API key for the next attempt
+            if cycle == 0:
+                logger.warning("Chat agent: all fallback models failed in cycle 0. Rotating Google key and retrying...")
+                _rotate_google_key()
+
+
+    if not answer:
+        logger.error("Chat agent: all models failed. Last error: %s", last_error)
         answer = (
-            "I'm sorry, I encountered an error while generating a response. "
-            "Please try again or rephrase your question."
+            "I'm sorry, I encountered an error generating a response. "
+            "Please try again in a moment."
         )
 
     # ── 5. Update session history ────────────────────────────────────
     history.append(HumanMessage(content=question))
     history.append(AIMessage(content=answer))
 
-    # Keep history bounded (last 20 messages = 10 turns)
-    if len(history) > 20:
-        _sessions[session_id] = history[-20:]
+    # Keep history bounded (last 10 messages = 5 turns)
+    if len(history) > 10:
+        _sessions[session_id] = history[-10:]
 
     logger.info(
         "Chat response: session=%s, sources=%d, relevant=%s, answer_len=%d",

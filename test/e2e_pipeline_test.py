@@ -50,8 +50,9 @@ def test_supervisor_only():
     ])
 
     config = create_langfuse_config(
-        session_id="e2e-test",
-        trace_name="test-supervisor",
+        session_id="test_e2e_pipeline",
+        trace_name="test-full-pipeline",
+        use_callbacks=True,
     )
 
     start = time.time()
@@ -114,7 +115,7 @@ def test_news_agent_only():
         return False, None
 
 
-def test_full_pipeline():
+async def test_full_pipeline():
     """Test the complete pipeline: Supervisor → Agents (parallel) → Synthesis."""
     from graph.workflow import run_research
 
@@ -127,7 +128,7 @@ def test_full_pipeline():
 
     start = time.time()
     try:
-        final_state = run_research(
+        final_state = await run_research(
             query="Analyse Apple's financial health, key risks, and recent news",
             company_name="Apple Inc.",
             ticker="AAPL",
@@ -216,7 +217,8 @@ if __name__ == "__main__":
     logger.info("")
 
     # Test 3: Full pipeline
-    results["full_pipeline"] = test_full_pipeline()
+    import asyncio
+    results["full_pipeline"] = asyncio.run(test_full_pipeline())
     logger.info("")
 
     # Summary

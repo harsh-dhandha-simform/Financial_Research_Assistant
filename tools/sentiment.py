@@ -41,7 +41,9 @@ SENTIMENT_PROMPT = ChatPromptTemplate.from_messages([
         "You are a financial sentiment analyst. Given a news headline and "
         "snippet about a company, classify the sentiment and provide a "
         "score from -1 (very negative) to +1 (very positive). "
-        "Be objective — focus on facts, not speculation."
+        "Be objective — focus on facts, not speculation.\n\n"
+        "Respond with ONLY a JSON object in this exact format:\n"
+        '{{"sentiment": "positive|neutral|negative", "score": 0.0, "reasoning": "brief reason"}}'
     )),
     ("human", "Headline: {headline}\n\nSnippet: {snippet}"),
 ])
@@ -62,13 +64,28 @@ def sentiment_scorer(headline: str, snippet: str) -> dict:
         Dict with sentiment, score (-1 to +1), and reasoning.
     """
     try:
-        from agents.base import get_llm
-        llm = get_llm("news")
-        structured_llm = llm.with_structured_output(
-            SentimentResult, method="json_mode"
-        )
-        chain = SENTIMENT_PROMPT | structured_llm
+        from agents.base import get_llm, AGENT_MODELS, _create_llm, _get_structured_llm
 
+        # Use dedicated lightweight sentiment model (Groq llama-3.1-8b-instant)
+        # This model reliably supports json_mode and is much faster/cheaper than
+        # the news agent's primary (Gemini). We never use the news agent's model
+        # here because Gemini does not support json_mode via OpenAI-compat.
+        sentiment_models = AGENT_MODELS.get("sentiment", [])
+        structured_llm = None
+        for model_config in sentiment_models:
+            try:
+                llm = _create_llm(model_config)
+                structured_llm = _get_structured_llm(
+                    llm, SentimentResult, model_config.structured_method
+                )
+                break
+            except Exception:
+                continue
+
+        if structured_llm is None:
+            raise RuntimeError("No sentiment model available")
+
+        chain = SENTIMENT_PROMPT | structured_llm
         result = chain.invoke({"headline": headline, "snippet": snippet})
 
         logger.info(

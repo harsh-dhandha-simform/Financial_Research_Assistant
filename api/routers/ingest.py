@@ -20,11 +20,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 
-def _chunk_and_store(raw_doc) -> dict:
+import uuid
+
+def _chunk_and_store(raw_doc, session_id: str) -> dict:
     """Chunk a RawDocument and store in Qdrant."""
     parents, children = chunk_document(raw_doc)
     parent_lookup = {p.chunk_id: p for p in parents}
-    store = QdrantStore()
+    
+    collection_name = f"fin_{session_id[:8]}"
+    store = QdrantStore(collection_name)
     stored = store.upsert_chunks(children, parent_lookup)
     return {
         "pages": len(raw_doc.pages),
@@ -39,15 +43,19 @@ async def ingest_from_url(
     url: str,
     company_name: str = "",
     ticker: str = "",
+    session_id: str = "",
 ):
     """Ingest a document from URL into Qdrant.
 
     Uses Jina Reader to extract content, chunks it, and stores
     in the vector database. Does NOT run the research pipeline.
     """
+    if not session_id:
+        session_id = f"api-{uuid.uuid4().hex[:8]}"
+
     try:
         raw_doc = ingest_url(url=url, company_name=company_name)
-        stats = _chunk_and_store(raw_doc)
+        stats = _chunk_and_store(raw_doc, session_id)
 
         return IngestResponse(
             status="success",
@@ -58,7 +66,7 @@ async def ingest_from_url(
             message=(
                 f"Ingested {stats['pages']} pages → "
                 f"{stats['parents']} parents, {stats['children']} children, "
-                f"{stats['chunks_stored']} stored in Qdrant"
+                f"{stats['chunks_stored']} stored in Qdrant for session {session_id}"
             ),
         )
     except Exception as exc:
@@ -71,12 +79,16 @@ async def ingest_from_upload(
     file: UploadFile = File(...),
     company_name: str = Form(""),
     ticker: str = Form(""),
+    session_id: str = Form(""),
 ):
     """Ingest a PDF into Qdrant.
 
     Extracts text via PyMuPDF, chunks it, and stores in the
     vector database. Does NOT run the research pipeline.
     """
+    if not session_id:
+        session_id = f"api-{uuid.uuid4().hex[:8]}"
+
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
@@ -87,7 +99,7 @@ async def ingest_from_upload(
             file_name=file.filename,
             company_name=company_name,
         )
-        stats = _chunk_and_store(raw_doc)
+        stats = _chunk_and_store(raw_doc, session_id)
 
         return IngestResponse(
             status="success",

@@ -68,6 +68,9 @@ def memo_to_markdown(memo: InvestmentMemo) -> str:
 def report_to_markdown(report: ResearchReport) -> str:
     """Render a ResearchReport as a Markdown string.
 
+    Embeds any pre-formatted tables from the synthesis agent
+    (valuation snapshot, SWOT analysis) directly into the output.
+
     Args:
         report: The ResearchReport to render.
 

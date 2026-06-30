@@ -132,6 +132,39 @@ def chunk_document(
         return [], []
 
     doc_id = document.doc_id
+    # Extract source info for chunk metadata
+    source_file_name = document.metadata.file_name or ""
+    source_company = document.metadata.company_name or ""
+
+    # ── Build page boundary map from document.pages ──────────────────────────
+    # The full text was assembled as "\n\n".join(page.content for page in pages)
+    # in pdf_reader.py. We reconstruct the character offsets here to map any
+    # position in `text` back to the correct 1-indexed PDF page number.
+    #
+    # Format: [(char_offset, page_number), ...] sorted by char_offset.
+    # _page_at_pos() uses bisect to find the page for a given char position.
+    page_boundaries: list[tuple[int, int]] = []
+    if document.pages:
+        offset = 0
+        for pg in document.pages:
+            page_boundaries.append((offset, pg.page_number))
+            offset += len(pg.content) + 2  # +2 for the "\n\n" joiner
+
+    def _page_at_pos(char_pos: int) -> int:
+        """Return the 1-indexed PDF page number for a character position."""
+        if not page_boundaries:
+            return 0  # No page info available (URL ingestion)
+        # Binary search: find the last page boundary ≤ char_pos
+        lo, hi = 0, len(page_boundaries) - 1
+        result_page = page_boundaries[0][1]
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if page_boundaries[mid][0] <= char_pos:
+                result_page = page_boundaries[mid][1]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return result_page
 
     # ── Step 1: Detect section boundaries ────────────────────────────────────
     section_boundaries = _detect_sections(text)
@@ -164,6 +197,9 @@ def chunk_document(
         midpoint = raw_parent.start_index + (raw_parent.end_index - raw_parent.start_index) // 2
         section = _section_at(section_boundaries, midpoint)
 
+        # Determine the actual PDF page from the parent's character position
+        pdf_page = _page_at_pos(raw_parent.start_index)
+
         parent = ParentChunk(
             doc_id=doc_id,
             content=raw_parent.text,
@@ -181,6 +217,10 @@ def chunk_document(
         raw_children = child_chunker.chunk(raw_parent.text)
 
         for child_idx, raw_child in enumerate(raw_children):
+            # The child's absolute char position in the full text
+            child_abs_pos = raw_parent.start_index + raw_child.start_index
+            child_page = _page_at_pos(child_abs_pos)
+
             child = ChildChunk(
                 parent_id=parent.chunk_id,
                 doc_id=doc_id,
@@ -192,6 +232,9 @@ def chunk_document(
                     "parent_chunk_index": parent_idx,
                     "start_index_in_parent": raw_child.start_index,
                     "end_index_in_parent": raw_child.end_index,
+                    "source_document": source_file_name,
+                    "company_name": source_company,
+                    "page": child_page,
                 },
             )
             children.append(child)
@@ -206,3 +249,4 @@ def chunk_document(
     )
 
     return parents, children
+

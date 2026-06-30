@@ -55,14 +55,16 @@ RULES:
 4. If the query is about news/sentiment, at minimum invoke "news".
 5. Always include a focused query tailored for each agent.
 6. Set context_needed=True for metrics and risk (they use RAG). Set False for news.
+7. You must provide a "reasoning" for your selection.
+8. You must include the "company_name", "ticker", and "original_query" exactly as provided.
 """
 
 SUPERVISOR_HUMAN = """\
-User query: {query}
-Company: {company_name}
-Ticker: {ticker}
+User query (original_query): {query}
+Company (company_name): {company_name}
+Ticker (ticker): {ticker}
 
-Decide which agents to invoke and provide focused queries for each.
+Decide which agents to invoke and output the JSON strictly adhering to the SupervisorDecision schema.
 """
 
 SUPERVISOR_PROMPT = ChatPromptTemplate.from_messages([
@@ -287,14 +289,7 @@ def output_fork_node(state: ResearchState) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-from graph.nodes.query_guardrail import query_guardrail_node
 from graph.nodes.document_gate import document_gate_node
-
-def route_guardrail(state: ResearchState) -> str:
-    """Route based on query guardrail."""
-    if state.guardrail_rejected:
-        return END
-    return "document_gate"
 
 def route_document_gate(state: ResearchState) -> str:
     """Route based on document gate."""
@@ -305,7 +300,7 @@ def route_document_gate(state: ResearchState) -> str:
 def build_research_graph() -> StateGraph:
     """Build and compile the LangGraph research workflow.
 
-    Graph: query_guardrail → document_gate → supervisor → run_agents → synthesis → output_fork → END
+    Graph: document_gate → supervisor → run_agents → synthesis → output_fork → END
 
     Returns:
         A compiled StateGraph ready for .invoke().
@@ -313,7 +308,6 @@ def build_research_graph() -> StateGraph:
     graph = StateGraph(ResearchState)
 
     # Add nodes
-    graph.add_node("query_guardrail", query_guardrail_node)
     graph.add_node("document_gate", document_gate_node)
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("run_agents", run_agents_node)
@@ -321,9 +315,8 @@ def build_research_graph() -> StateGraph:
     graph.add_node("output_fork", output_fork_node)
 
     # Define edges
-    graph.set_entry_point("query_guardrail")
+    graph.set_entry_point("document_gate")
     
-    graph.add_conditional_edges("query_guardrail", route_guardrail)
     graph.add_conditional_edges("document_gate", route_document_gate)
     
     graph.add_edge("supervisor", "run_agents")
@@ -332,7 +325,7 @@ def build_research_graph() -> StateGraph:
     graph.add_edge("output_fork", END)
 
     compiled = graph.compile()
-    logger.info("Research graph compiled: guardrail → gate → supervisor → agents → synthesis → output")
+    logger.info("Research graph compiled: gate → supervisor → agents → synthesis → output")
     return compiled
 
 
@@ -341,7 +334,7 @@ def build_research_graph() -> StateGraph:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def run_research(
+async def run_research(
     query: str,
     company_name: str,
     ticker: str = "",
@@ -377,7 +370,7 @@ def run_research(
         query, company_name, ticker,
     )
 
-    result = graph.invoke(initial_state.model_dump(), config=config)
+    result = await graph.ainvoke(initial_state.model_dump(), config=config)
     final_state = ResearchState(**result)
 
     logger.info(

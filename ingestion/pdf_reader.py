@@ -135,14 +135,51 @@ def ingest_pdf(
         page = pdf[page_num]
         text = page.get_text("text")
 
-        if text.strip():
+        # ── Extract structured tables from the page ──────────────────────
+        # PyMuPDF find_tables() detects tabular structures and returns them
+        # as structured objects. We convert them to markdown tables and
+        # append them after the page text so agents can parse them properly.
+        table_md_parts = []
+        try:
+            tables = page.find_tables()
+            for table in tables:
+                rows = table.extract()
+                if not rows or len(rows) < 2:
+                    continue
+                # Build markdown table from extracted rows
+                # First row is header
+                header = rows[0]
+                header_clean = [str(h).strip() if h else "" for h in header]
+                md_lines = [
+                    "| " + " | ".join(header_clean) + " |",
+                    "| " + " | ".join(["---"] * len(header_clean)) + " |",
+                ]
+                for row in rows[1:]:
+                    cells = [str(c).strip() if c else "" for c in row]
+                    md_lines.append("| " + " | ".join(cells) + " |")
+                table_md_parts.append("\n".join(md_lines))
+        except Exception:
+            pass  # Some pages may not have tables; silently continue
+
+        # Combine text + any extracted tables
+        if table_md_parts:
+            tables_block = (
+                "\n\n[FINANCIAL TABLE START]\n"
+                + "\n\n".join(table_md_parts)
+                + "\n[FINANCIAL TABLE END]\n"
+            )
+            combined_text = text + tables_block
+        else:
+            combined_text = text
+
+        if combined_text.strip():
             pages.append(
                 DocumentPage(
                     page_number=page_num + 1,
-                    content=text,
+                    content=combined_text,
                 )
             )
-            all_text_parts.append(text)
+            all_text_parts.append(combined_text)
 
     pdf.close()
 

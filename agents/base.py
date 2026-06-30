@@ -93,10 +93,11 @@ class ModelConfig:
 
     model_id: str
     provider: str        # "hf_inference", "openrouter", "groq", "cerebras", "google", "nvidia"
-    max_tokens: int = 4096
+    max_tokens: int | None = None   # None = use model's own max output limit
     temperature: float = 0.0
     timeout: int = REQUEST_TIMEOUT
     structured_method: str = "json_schema"
+    max_tool_output_chars: int = MAX_TOOL_OUTPUT_CHARS  # per-model override to prevent TPM blowout
 
 
 # Agent → (primary, fallback) model chains
@@ -112,36 +113,59 @@ class ModelConfig:
 AGENT_MODELS: dict[str, list[ModelConfig]] = {
     "metrics": [
         ModelConfig(
-            "meta-llama/Llama-3.1-8B-Instruct:scaleway", "hf_inference",
+            "gpt-oss-120b", "cerebras",
             structured_method="json_mode",
         ),
         ModelConfig(
-            "llama-3.1-8b-instant", "groq",
+            "llama-3.3-70b-versatile", "groq",
+            max_tokens=8192,  # Keep low to avoid Groq TPM limits
             structured_method="json_mode",
+            max_tool_output_chars=2500,  # Tighter limit for free-tier Groq
         ),
         ModelConfig(
-            "groq/compound", "groq",
+            "qwen/qwen3-32b", "groq",
             structured_method="json_mode",
-        ),
+            max_tool_output_chars=8192,
+        )
     ],
     "risk": [
-        ModelConfig(
-            "Qwen/Qwen2.5-72B-Instruct:featherless-ai", "hf_inference",
-            structured_method="json_mode",
-        ),
         ModelConfig(
             "nvidia/nemotron-3-super-120b-a12b", "nvidia",
             structured_method="json_mode",
         ),
+        ModelConfig(
+            "gpt-oss-120b", "cerebras",
+            structured_method="json_mode",
+        ),
+        ModelConfig(
+            "llama-3.3-70b-versatile", "groq",
+            max_tokens=11000,
+            structured_method="json_mode",
+            max_tool_output_chars=2500,
+        ),
     ],
     "news": [
-        # gemini-2.5-flash primary — Groq Llama fallback (Gemini 3.5 has thought_signature bugs)
+        # gemini-2.5-flash primary — Groq Llama fallback
+        # 8192 tokens is generous for chat responses without risk of runaway output
         ModelConfig(
             "gemini-2.5-flash", "google",
+            max_tokens=8192,
             structured_method="function_calling",
         ),
         ModelConfig(
             "llama-3.3-70b-versatile", "groq",
+            max_tokens=8192,
+            structured_method="json_mode",
+            max_tool_output_chars=1000,  # Very tight — Groq 12k TPM limit
+        ),
+        ModelConfig(
+            "groq/compound", "groq",
+            max_tokens=8192,
+            structured_method="json_mode",
+        ),
+        ModelConfig(
+            "zai-glm-4.7", "cerebras",
+            max_tokens=8192,
             structured_method="json_mode",
         ),
     ],
@@ -158,6 +182,15 @@ AGENT_MODELS: dict[str, list[ModelConfig]] = {
             "Qwen/Qwen2.5-72B-Instruct:featherless-ai", "hf_inference",
             structured_method="json_mode",
             timeout=120,
+        ),
+    ],
+    # Dedicated lightweight model for per-article sentiment scoring
+    # Groq llama-3.1-8b is fast and supports json_mode reliably
+    "sentiment": [
+        ModelConfig(
+            "llama-3.1-8b-instant", "groq",
+            max_tokens=512,
+            structured_method="json_mode",
         ),
     ],
 }
@@ -220,6 +253,23 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "429" in exc_str or "rate limit" in exc_str or "rate_limit" in exc_str
 
 
+def _is_overloaded_error(exc: Exception) -> bool:
+    """Check if an exception is a 503 model-overloaded / high-demand error.
+
+    Google Gemini returns 503 UNAVAILABLE when the model is experiencing high
+    demand. This is transient and should trigger an immediate fallback to the
+    next model, exactly like a 429 rate limit.
+    """
+    exc_str = str(exc).lower()
+    return (
+        "503" in exc_str
+        or "unavailable" in exc_str
+        or "high demand" in exc_str
+        or "overloaded" in exc_str
+        or "service unavailable" in exc_str
+    )
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     """Check if an exception is a timeout error."""
     exc_str = str(exc).lower()
@@ -231,10 +281,17 @@ def _is_json_error(exc: Exception) -> bool:
     return isinstance(exc, (ValidationError, ValueError)) or "json" in str(exc).lower()
 
 
+def _is_transient_error(exc: Exception) -> bool:
+    """Check if an error is transient (should trigger fallback / key rotation)."""
+    return _is_rate_limit_error(exc) or _is_overloaded_error(exc) or _is_timeout_error(exc)
+
+
 def _classify_error(exc: Exception) -> str:
     """Classify an error for logging purposes."""
     if _is_rate_limit_error(exc):
         return "RATE_LIMIT_429"
+    if _is_overloaded_error(exc):
+        return "OVERLOADED_503"
     if _is_timeout_error(exc):
         return "TIMEOUT"
     if _is_json_error(exc):
@@ -250,14 +307,31 @@ def _create_llm(config: ModelConfig) -> ChatOpenAI:
     if not api_key:
         raise ValueError(f"No API key for provider '{config.provider}'")
 
-    return ChatOpenAI(
-        model=config.model_id,
-        openai_api_key=api_key,
-        openai_api_base=base_url,
-        temperature=config.temperature,
-        max_tokens=config.max_tokens,
-        request_timeout=config.timeout,
-    )
+    kwargs: dict = {
+        "model": config.model_id,
+        "openai_api_key": api_key,
+        "openai_api_base": base_url,
+        "temperature": config.temperature,
+        "request_timeout": config.timeout,
+    }
+    # Only pass max_tokens when explicitly set — omitting it lets the model use its own max
+    if config.max_tokens is not None:
+        kwargs["max_tokens"] = config.max_tokens
+    
+    # Disable built-in retries for Google so our manual fallback/rotation takes over instantly
+    if config.provider == "google":
+        kwargs["max_retries"] = 0
+
+    # For groq/compound, pass its required compound_custom config in extra_body
+    # to avoid TypeError in the OpenAI client.
+    if config.model_id == "groq/compound":
+        kwargs["model_kwargs"] = {
+            "extra_body": {
+                "compound_custom": {"tools": {"enabled_tools": ["web_search", "wolfram_alpha", "visit_website"]}}
+            }
+        }
+
+    return ChatOpenAI(**kwargs)
 
 
 def _get_structured_llm(
@@ -334,6 +408,8 @@ def _resolve_tool(tool_name: str, tools: list[BaseTool]) -> BaseTool | None:
 def _execute_tool_calls(
     ai_message: AIMessage,
     tools: list[BaseTool],
+    config: dict | None = None,
+    max_tool_output_chars: int = MAX_TOOL_OUTPUT_CHARS,
 ) -> list[ToolMessage]:
     """Execute all tool calls from an AI message and return ToolMessages."""
     tool_messages = []
@@ -345,15 +421,15 @@ def _execute_tool_calls(
 
         tool = _resolve_tool(tool_name, tools)
         if tool is None:
-            result = f"Error: Unknown tool '{tool_name}'"
+            result_str = f"Error: Unknown tool '{tool_name}'"
             logger.warning("Unknown tool called: %s", tool_name)
         else:
             try:
-                result = tool.invoke(tool_args)
+                result = tool.invoke(tool_args, config=config)
                 result_str = str(result)
                 # Truncate to prevent TPM blowout on free-tier providers
-                if len(result_str) > MAX_TOOL_OUTPUT_CHARS:
-                    result_str = result_str[:MAX_TOOL_OUTPUT_CHARS] + "\n... [truncated]"
+                if len(result_str) > max_tool_output_chars:
+                    result_str = result_str[:max_tool_output_chars] + "\n... [truncated]"
                 logger.info(
                     "Tool '%s' executed: args=%s → %s chars",
                     tool_name,
@@ -380,57 +456,71 @@ def _prepare_messages_for_structured_output(
     messages: list,
     method: str,
     output_schema: type[BaseModel],
+    max_total_chars: int = 12000,
 ) -> list:
     """Prepare message list for the structured output call.
 
-    Fixes two provider-specific issues:
-    1. HF Inference "add_generation_prompt" error — when the last message
-       is from the assistant, HF rejects the request. We inject a
-       HumanMessage to fix the turn ordering.
-    2. json_mode providers need explicit JSON instruction so the model
-       knows to output JSON (required by Qwen, Groq, etc.).
+    Fixes provider-specific issues:
+    1. HF Inference / Groq: when last message is tool/assistant, injects a
+       HumanMessage to fix turn ordering.
+    2. json_mode providers need an explicit JSON instruction so the model
+       outputs the schema (not another tool call).
+    3. Truncates accumulated tool message content to avoid 413 / TPM errors.
 
     Args:
         messages: The accumulated conversation messages.
         method: The structured output method being used.
         output_schema: The Pydantic schema (used to build JSON instruction).
+        max_total_chars: Hard cap on total chars of tool-output content.
 
     Returns:
         A copy of messages with any necessary fixups applied.
     """
-    msgs = list(messages)  # shallow copy
+    # ── 1. Truncate bulky tool outputs from the history ──────────────────
+    # We summarise the tool messages to just the first N chars each so
+    # the extraction call doesn't blow past free-tier TPM limits.
+    msgs: list = []
+    total_tool_chars = 0
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            content = str(msg.content)
+            remaining = max(0, max_total_chars - total_tool_chars)
+            if len(content) > remaining:
+                content = content[:remaining] + "\n...[truncated for token limit]"
+            total_tool_chars += len(content)
+            msgs.append(ToolMessage(content=content, tool_call_id=msg.tool_call_id))
+        else:
+            msgs.append(msg)
 
-    # Fix: If the last message is an AIMessage or ToolMessage, some providers
-    # (HF/Scaleway) fail with role ordering errors like
-    # "Unexpected role 'user' after role 'tool'".
-    # Always add a HumanMessage to ensure proper turn ordering.
-    needs_human_suffix = (
-        msgs and isinstance(msgs[-1], (AIMessage, ToolMessage))
-    )
+    # ── 2. Build the extraction instruction ─────────────────────────────
+    schema_hint = output_schema.model_json_schema()
 
     if method == "json_mode":
-        # json_mode providers need explicit JSON instruction.
-        # Qwen specifically requires the word "json" in the messages.
-        schema_hint = output_schema.model_json_schema()
+        # For json_mode providers (Groq, Cerebras, NVIDIA): inject an explicit
+        # extraction prompt.  Critically, we forbid further tool calls to prevent
+        # models like NVIDIA Nemotron from outputting a tool-call JSON.
         extraction_msg = HumanMessage(
             content=(
-                "Based on all the information gathered above, produce your "
-                "final analysis as valid JSON matching this schema:\n\n"
-                f"```json\n{schema_hint}\n```\n\n"
-                "Respond ONLY with the JSON object, no markdown or explanation."
+                "=== FINAL EXTRACTION PHASE ===\n"
+                "You have finished gathering information. DO NOT call any tools.\n"
+                "Produce ONLY a single JSON object matching the schema below.\n"
+                "Do NOT wrap in markdown, do NOT add explanation, output JSON only.\n\n"
+                f"Required JSON schema:\n```json\n{schema_hint}\n```\n\n"
+                "Respond with only the JSON object:"
             )
         )
         msgs.append(extraction_msg)
-    elif needs_human_suffix:
-        # For json_schema/function_calling: just fix the turn ordering
-        msgs.append(
-            HumanMessage(
-                content=(
-                    "Now produce your final structured analysis based on "
-                    "everything above."
+    else:
+        # function_calling / json_schema: just fix turn ordering if needed
+        if msgs and isinstance(msgs[-1], (AIMessage, ToolMessage)):
+            msgs.append(
+                HumanMessage(
+                    content=(
+                        "Now produce your final structured analysis based on "
+                        "everything above."
+                    )
                 )
             )
-        )
 
     return msgs
 
@@ -519,7 +609,10 @@ def run_tool_agent(
                         break
 
                     # Execute tool calls and feed results back
-                    tool_messages = _execute_tool_calls(response, tools)
+                    tool_messages = _execute_tool_calls(
+                        response, tools, config=config,
+                        max_tool_output_chars=model_config.max_tool_output_chars,
+                    )
                     messages.extend(tool_messages)
                     tool_call_count += len(response.tool_calls)
 
@@ -529,10 +622,13 @@ def run_tool_agent(
                     )
 
                 # ── Structured output from accumulated messages ─────────
-                # Prepare messages: fix turn ordering & inject JSON hints
-                # for providers that need them.
+                # Prepare messages: fix turn ordering, inject JSON hints,
+                # and truncate tool outputs to prevent TPM blowout.
                 output_messages = _prepare_messages_for_structured_output(
-                    messages, model_config.structured_method, output_schema,
+                    messages,
+                    model_config.structured_method,
+                    output_schema,
+                    max_total_chars=model_config.max_tool_output_chars * 4,
                 )
                 structured_llm = _get_structured_llm(
                     llm, output_schema, model_config.structured_method,
@@ -659,12 +755,25 @@ def invoke_with_fallback(
 def create_langfuse_config(
     session_id: str = "",
     trace_name: str = "",
+    use_callbacks: bool = False,
     **kwargs,
 ) -> dict:
-    """Create a LangChain config dict with Langfuse tracing attached."""
-    handler = get_langfuse_handler(
-        session_id=session_id,
-        trace_name=trace_name,
-        **kwargs,
-    )
-    return {"callbacks": [handler]}
+    """Create a LangChain config dict with Langfuse tracing attached.
+    
+    If use_callbacks is True, creates a fresh CallbackHandler.
+    Otherwise, relies on parent callbacks for tracing to avoid UUID conflicts
+    when running multiple parallel threads, but still propagates the session_id.
+    """
+    config = {
+        "configurable": {
+            "session_id": session_id,
+        }
+    }
+    if use_callbacks:
+        handler = get_langfuse_handler(
+            session_id=session_id,
+            trace_name=trace_name,
+            **kwargs,
+        )
+        config["callbacks"] = [handler]
+    return config

@@ -43,10 +43,6 @@ from schemas.chunks import ChildChunk, ParentChunk
 from schemas.retrieval import RetrievedChunk
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_COLLECTION = "financial_chunks"
-
-
 class QdrantStore:
     """Manages a Qdrant collection for child chunk embeddings.
 
@@ -58,8 +54,11 @@ class QdrantStore:
 
     def __init__(
         self,
-        collection_name: str = DEFAULT_COLLECTION,
+        collection_name: str,
     ):
+        if not collection_name:
+            raise ValueError("QdrantStore requires a valid session-scoped collection_name.")
+        
         self.collection_name = collection_name
         self.dimensions = get_embedding_dimensions()
 
@@ -226,14 +225,20 @@ class QdrantStore:
             )
         query_filter = Filter(must=must_conditions) if must_conditions else None
 
-        results = self.client.query_points(
-            collection_name=self.collection_name,
-            query=query_vector,
-            query_filter=query_filter,
-            limit=top_k,
-            score_threshold=score_threshold,
-            with_payload=True,
-        )
+        try:
+            results = self.client.query_points(
+                collection_name=self.collection_name,
+                query=query_vector,
+                query_filter=query_filter,
+                limit=top_k,
+                score_threshold=score_threshold,
+                with_payload=True,
+            )
+        except Exception as e:
+            if "Not found: Collection" in str(e):
+                logger.info("Collection '%s' not found (likely empty/new session). Returning empty results.", self.collection_name)
+                return []
+            raise
 
         # Convert to RetrievedChunk objects
         retrieved: list[RetrievedChunk] = []
@@ -247,6 +252,7 @@ class QdrantStore:
                 section=payload.get("section", ""),
                 score=point.score if point.score is not None else 0.0,
                 retrieval_method="dense",
+                metadata=payload.get("metadata", {}),
             )
             retrieved.append(chunk)
 

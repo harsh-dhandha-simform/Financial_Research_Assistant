@@ -301,49 +301,84 @@ def _try_google_embeddings(model_id: str) -> Embeddings | None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+class RobustFallbackEmbeddings(Embeddings):
+    """LangChain Embeddings wrapper that automatically falls back to the next model on runtime failure."""
+    def __init__(self):
+        self.active_index = 0
+        self.active_model = None
+        self._initialize_model()
+
+    def _initialize_model(self):
+        global _active_model_name, _active_dimensions
+        for i in range(self.active_index, len(EMBEDDING_CHAIN)):
+            name, provider, model_id, dimensions = EMBEDDING_CHAIN[i]
+            
+            # If we've already started embedding with a certain dimension size,
+            # we must only fallback to models with the same dimensionality to avoid DB corruption.
+            if _active_dimensions > 0 and dimensions != _active_dimensions:
+                continue
+
+            logger.info("Trying embedding model: %s (%s)", name, provider)
+            model = None
+            if provider == "google":
+                model = _try_google_embeddings(model_id)
+            elif provider == "hf_inference":
+                model = _try_hf_inference_embeddings(model_id)
+            elif provider == "hf_local":
+                model = _try_hf_local_embeddings(model_id)
+            elif provider == "voyage":
+                model = _try_voyage_embeddings(model_id)
+            elif provider == "nomic":
+                model = _try_nomic_embeddings(model_id)
+            elif provider == "openai":
+                model = _try_openai_embeddings(model_id)
+
+            if model is not None:
+                self.active_model = model
+                self.active_index = i
+                _active_model_name = name
+                _active_dimensions = dimensions
+                logger.info("✅ Active embedding model: %s (%d dims)", name, dimensions)
+                return
+
+        raise RuntimeError(
+            "All embedding models failed. Ensure HF_TOKEN, VOYAGE_API_KEY, "
+            "NOMIC_API_KEY, or API_KEY is set in .env."
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        while True:
+            try:
+                if not self.active_model:
+                    self._initialize_model()
+                return self.active_model.embed_documents(texts)
+            except Exception as e:
+                logger.warning("Embedding failed with %s: %s", EMBEDDING_CHAIN[self.active_index][0], e)
+                self.active_model = None
+                self.active_index += 1
+                self._initialize_model()
+
+    def embed_query(self, text: str) -> list[float]:
+        while True:
+            try:
+                if not self.active_model:
+                    self._initialize_model()
+                return self.active_model.embed_query(text)
+            except Exception as e:
+                logger.warning("Embedding failed with %s: %s", EMBEDDING_CHAIN[self.active_index][0], e)
+                self.active_model = None
+                self.active_index += 1
+                self._initialize_model()
+
+
 @lru_cache(maxsize=1)
 def get_embedding_model() -> Embeddings:
-    """Get the best available embedding model via fallback chain.
-
-    Tries each model in EMBEDDING_CHAIN order. First successful model
-    is cached and reused for all subsequent calls.
+    """Get the best available embedding model via robust fallback chain.
 
     Returns:
-        A LangChain Embeddings instance.
-
-    Raises:
-        RuntimeError: If all models in the fallback chain fail.
+        A LangChain Embeddings instance that auto-falls back on failure.
     """
-    global _active_model_name, _active_dimensions
-
-    for name, provider, model_id, dimensions in EMBEDDING_CHAIN:
-        logger.info("Trying embedding model: %s (%s)", name, provider)
-
-        if provider == "google":
-            model = _try_google_embeddings(model_id)
-        elif provider == "hf_inference":
-            model = _try_hf_inference_embeddings(model_id)
-        elif provider == "hf_local":
-            model = _try_hf_local_embeddings(model_id)
-        elif provider == "voyage":
-            model = _try_voyage_embeddings(model_id)
-        elif provider == "nomic":
-            model = _try_nomic_embeddings(model_id)
-        elif provider == "openai":
-            model = _try_openai_embeddings(model_id)
-        else:
-            continue
-
-        if model is not None:
-            _active_model_name = name
-            _active_dimensions = dimensions
-            logger.info("✅ Active embedding model: %s (%d dims)", name, dimensions)
-            return model
-
-    raise RuntimeError(
-        "All embedding models failed. Ensure HF_TOKEN, VOYAGE_API_KEY, "
-        "NOMIC_API_KEY, or API_KEY is set in .env."
-    )
+    return RobustFallbackEmbeddings()
 
 
 def embed_texts(

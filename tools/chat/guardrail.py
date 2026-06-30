@@ -7,21 +7,22 @@ or inappropriate, it returns a rejection message immediately.
 
 import json
 import logging
-from typing import tuple
+from typing import Tuple
 
 from langchain_openai import ChatOpenAI
 
 from config import settings
 from callbacks import get_langfuse_handler
+from langfuse.decorators import observe
 
 logger = logging.getLogger(__name__)
 
 CHAT_GUARDRAIL_SYSTEM = """You are a strict guardrail for a financial chat assistant.
 Your job is to determine if the user's question is relevant to financial research,
-a specific company, SEC filings, investing, or market analysis.
+a specific company, SEC filings, investing, market analysis, or ANY uploaded documents/PDFs.
 
-If the query is valid, respond with:
-{"valid": true, "reason": "valid financial question"}
+If the query is valid (including ANY questions about uploaded documents), respond with:
+{"valid": true, "reason": "valid financial or document question"}
 
 If the query is completely unrelated (e.g. coding help, writing a poem, recipes,
 or general chitchat), respond with:
@@ -30,7 +31,8 @@ or general chitchat), respond with:
 Output MUST be valid JSON only.
 """
 
-def check_chat_guardrail(question: str, session_id: str) -> tuple[bool, str]:
+@observe()
+def check_chat_guardrail(question: str, session_id: str) -> Tuple[bool, str]:
     """Check if a chat question is valid before performing RAG.
     
     Returns:
@@ -43,7 +45,7 @@ def check_chat_guardrail(question: str, session_id: str) -> tuple[bool, str]:
     llm = ChatOpenAI(
         base_url="https://api.groq.com/openai/v1",
         api_key=settings.groq_api_key,
-        model="compound-mini",
+        model="llama-3.1-8b-instant",
         temperature=0,
         max_tokens=150,
     )

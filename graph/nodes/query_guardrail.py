@@ -1,7 +1,7 @@
 """
 Query Guardrail node — validates the user's research query.
 
-Uses groq/compound-mini to quickly classify if the query is a valid
+Uses groq/llama-3.1-8b-instant to quickly classify if the query is a valid
 financial/investment research request. If not, it routes to END.
 """
 
@@ -14,6 +14,7 @@ from langchain_openai import ChatOpenAI
 from config import settings
 from graph.state import ResearchState
 from callbacks import get_langfuse_handler
+from langfuse.decorators import observe
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ or general chitchat), respond with:
 Output MUST be valid JSON only.
 """
 
+@observe()
 def query_guardrail_node(state: ResearchState) -> dict[str, Any]:
     """Validate the user query before kicking off the research pipeline."""
     logger.info("Guardrail: checking query: '%s'", state.query[:80])
@@ -42,7 +44,7 @@ def query_guardrail_node(state: ResearchState) -> dict[str, Any]:
     llm = ChatOpenAI(
         base_url="https://api.groq.com/openai/v1",
         api_key=settings.groq_api_key,
-        model="compound-mini",
+        model="llama-3.1-8b-instant",
         temperature=0,
         max_tokens=150,
     )
