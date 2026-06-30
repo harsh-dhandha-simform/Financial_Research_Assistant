@@ -6,7 +6,7 @@ A multi-agent financial research system that ingests SEC filings and corporate d
 
 ## System Architecture
 
-![Full end-to-end architecture — Ingestion → Retrieval → LangGraph Pipeline → Export → Conversational RAG → Tools](full_architecture.png)
+![Full end-to-end architecture — Ingestion → Retrieval → LangGraph Pipeline → Export → Conversational RAG → Tools](https://github.com/user-attachments/assets/80e7c951-db5c-4831-bec5-12fc123dc864)
 
 > **Source:** [`full_architecture.excalidraw`](full_architecture.excalidraw) — open in [excalidraw.com](https://excalidraw.com) to explore interactively.
 
