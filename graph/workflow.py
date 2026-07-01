@@ -17,11 +17,11 @@ Graph topology:
 """
 
 import logging
-
 import asyncio
 
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from agents.base import invoke_with_fallback, create_langfuse_config
 from agents.metrics_agent import run_metrics_agent
@@ -31,8 +31,21 @@ from agents.synthesis_agent import run_synthesis_agent
 from graph.state import ResearchState
 from output.report_generator import generate_output_fork
 from schemas.agents import SupervisorDecision
+from config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def get_checkpoint_conn_string() -> str:
+    """Return the psycopg3-compatible Postgres URI for the LangGraph checkpointer.
+
+    AsyncPostgresSaver uses psycopg3 which expects 'postgresql://' (not the
+    SQLAlchemy asyncpg variant 'postgresql+asyncpg://').
+    """
+    uri = settings.supabase_uri or ""
+    # settings.supabase_uri uses the asyncpg dialect for SQLAlchemy;
+    # strip the driver prefix so psycopg3 can use it directly.
+    return uri.replace("postgresql+asyncpg://", "postgresql://")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -297,13 +310,23 @@ def route_document_gate(state: ResearchState) -> str:
         return END
     return "supervisor"
 
-def build_research_graph() -> StateGraph:
+def _build_research_graph(checkpointer=None) -> StateGraph:
     """Build and compile the LangGraph research workflow.
+
+    Called ONCE at module load — the compiled graph is reused for every
+    subsequent request.  Compiling on every call wastes CPU on schema
+    validation and graph optimisation that never changes at runtime.
+
+    Args:
+        checkpointer: Optional LangGraph checkpointer (e.g. AsyncPostgresSaver).
+                      When provided, LangGraph persists state after each node so
+                      a failed pipeline can resume from the last successful node
+                      rather than restarting from scratch.
 
     Graph: document_gate → supervisor → run_agents → synthesis → output_fork → END
 
     Returns:
-        A compiled StateGraph ready for .invoke().
+        A compiled StateGraph ready for .invoke() / .astream().
     """
     graph = StateGraph(ResearchState)
 
@@ -316,17 +339,25 @@ def build_research_graph() -> StateGraph:
 
     # Define edges
     graph.set_entry_point("document_gate")
-    
+
     graph.add_conditional_edges("document_gate", route_document_gate)
-    
+
     graph.add_edge("supervisor", "run_agents")
     graph.add_edge("run_agents", "synthesis")
     graph.add_edge("synthesis", "output_fork")
     graph.add_edge("output_fork", END)
 
-    compiled = graph.compile()
-    logger.info("Research graph compiled: gate → supervisor → agents → synthesis → output")
+    compiled = graph.compile(checkpointer=checkpointer)
     return compiled
+
+
+# Compile the graph once when the module is first imported.
+# All calls to run_research() share this single compiled instance.
+_compiled_graph = _build_research_graph()
+logger.info("Research graph compiled: gate → supervisor → agents → synthesis → output")
+
+# Public alias — importable by app.py, tests, etc.
+compiled_research_graph = _compiled_graph
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -340,38 +371,57 @@ async def run_research(
     ticker: str = "",
     session_id: str = "",
 ) -> ResearchState:
-    """Run the full research pipeline.
+    """Run the full research pipeline with Postgres-backed checkpointing.
+
+    LangGraph saves state after every node into Supabase Postgres under the
+    given session_id (used as thread_id).  If a node fails and the function
+    is called again with the same session_id, LangGraph automatically resumes
+    from the last successfully completed node — no re-work is done.
 
     Args:
         query: User's research query, e.g. "Analyse Apple's FY2024 10-K".
         company_name: Company name, e.g. "Apple Inc.".
         ticker: Stock ticker, e.g. "AAPL".
-        session_id: Langfuse session ID for tracing.
+        session_id: Used as the LangGraph thread_id for checkpointing.
 
     Returns:
         The final ResearchState with all agent outputs and synthesis.
     """
-    graph = build_research_graph()
+    resolved_session_id = session_id or f"research-{company_name.lower().replace(' ', '-')}"
 
     initial_state = ResearchState(
         query=query,
         company_name=company_name,
         ticker=ticker,
-        session_id=session_id or f"research-{company_name.lower().replace(' ', '-')}",
+        session_id=resolved_session_id,
     )
 
-    config = create_langfuse_config(
-        session_id=initial_state.session_id,
+    base_config = create_langfuse_config(
+        session_id=resolved_session_id,
         trace_name="research-pipeline",
     )
+    # Inject thread_id so LangGraph checkpointer can identify this session
+    base_config["configurable"]["thread_id"] = resolved_session_id
 
     logger.info(
-        "Starting research pipeline: '%s' for %s (%s)",
-        query, company_name, ticker,
+        "Starting research pipeline: '%s' for %s (%s) [thread_id=%s]",
+        query, company_name, ticker, resolved_session_id,
     )
 
-    result = await graph.ainvoke(initial_state.model_dump(), config=config)
-    final_state = ResearchState(**result)
+    conn_string = get_checkpoint_conn_string()
+    if not conn_string:
+        # No DB configured — fall back to running without checkpointing
+        logger.warning("No Supabase URI configured — running pipeline without checkpointing")
+        graph = _build_research_graph(checkpointer=None)
+        result = await graph.ainvoke(initial_state.model_dump(), config=base_config)
+        final_state = ResearchState(**result)
+    else:
+        async with AsyncPostgresSaver.from_conn_string(conn_string) as checkpointer:
+            # Setup creates the checkpointing tables in Postgres on first run
+            await checkpointer.setup()
+            graph = _build_research_graph(checkpointer=checkpointer)
+            result = await graph.ainvoke(initial_state.model_dump(), config=base_config)
+            final_state = ResearchState(**result)
 
     logger.info(
         "Research pipeline complete. Rating: %s, Errors: %d",

@@ -51,7 +51,8 @@ from ui.actions.export_actions import (
     export_report_docx, export_report_pdf,
 )
 from ui.components import show_welcome, show_scoped_sources, show_global_sources_tab, show_pipeline_actions
-from graph.workflow import build_research_graph
+from graph.workflow import compiled_research_graph, get_checkpoint_conn_string, _build_research_graph
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from graph.state import ResearchState
 from agents.base import create_langfuse_config
 from tools.retriever import prewarm_bm25_for_user
@@ -760,9 +761,74 @@ async def on_message(message: cl.Message):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Pipeline handler — runs LangGraph with live activity feed (Change 13)
+# Pipeline stream event processor — shared by both checkpointed and plain runs
 # ═════════════════════════════════════════════════════════════════════════════
 
+
+async def _process_stream_event(
+    event: dict,
+    pipeline_step,
+    session: UserSession | None,
+    state_dict: dict,
+) -> bool:
+    """Process a single LangGraph stream event, updating the UI and state_dict.
+
+    Args:
+        event: A single event from graph.astream() — keys are node names.
+        pipeline_step: The active cl.Step to update with progress labels.
+        session: The current UserSession (used for early gate-rejection status update).
+        state_dict: Mutable dict that accumulates state updates across events.
+
+    Returns:
+        True if the pipeline was gate-rejected and should stop, False otherwise.
+    """
+    for node_name, state_update in event.items():
+        if node_name == "document_gate":
+            if state_update.get("gate_rejected"):
+                msg = state_update.get("rejection_message", "Query rejected.")
+                await cl.Message(content=f"⚠️ {msg}").send()
+                if session:
+                    session.pipeline_status = "error"
+                    session_store.update(session)
+                pipeline_step.status = "failed"
+                return True  # signal: stop processing
+
+        elif node_name == "supervisor":
+            decision = state_update.get("supervisor_decision")
+            if decision:
+                tasks = getattr(decision, "tasks", [])
+                if not tasks and isinstance(decision, dict):
+                    tasks = decision.get("tasks", [])
+                task_names = []
+                for t in tasks:
+                    name = t.get("agent_name", "") if isinstance(t, dict) else getattr(t, "agent_name", "")
+                    if name:
+                        task_names.append(f"`{name}`")
+                await cl.Message(
+                    content=f"⚙️ Supervisor assigned: {', '.join(task_names)}. Running agents..."
+                ).send()
+                pipeline_step.name = "⚙️ Agents running in parallel..."
+                await pipeline_step.update()
+
+        elif node_name == "run_agents":
+            await cl.Message(content="📝 Agents complete. Synthesis combining results...").send()
+            pipeline_step.name = "📝 Synthesizing results..."
+            await pipeline_step.update()
+
+        elif node_name == "synthesis":
+            await cl.Message(content="📋 Synthesis complete. Formatting output...").send()
+            pipeline_step.name = "✅ Pipeline complete!"
+            pipeline_step.status = "success"
+            await pipeline_step.update()
+
+        state_dict.update(state_update)
+
+    return False  # not rejected
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Pipeline handler — runs LangGraph with live activity feed
+# ═════════════════════════════════════════════════════════════════════════════
 
 async def _handle_pipeline(data: dict, session_id: str, session: UserSession):
     """Run the full research pipeline with cl.Step activity feed."""
@@ -789,7 +855,6 @@ async def _handle_pipeline(data: dict, session_id: str, session: UserSession):
 
     try:
 
-        graph = build_research_graph()
         initial_state = ResearchState(
             query=query,
             company_name=company_name,
@@ -801,52 +866,30 @@ async def _handle_pipeline(data: dict, session_id: str, session: UserSession):
             trace_name="research-pipeline",
             use_callbacks=True,
         )
+        # thread_id tells LangGraph which checkpoint to save/resume for this session
+        config["configurable"]["thread_id"] = session_id
 
         state_dict = initial_state.model_dump()
 
+        # Build a graph with Postgres checkpointer if DB is available, else use
+        # the module-level pre-compiled graph (no checkpointing).
+        conn_string = get_checkpoint_conn_string()
+
         # Stream graph with cl.Step activity feed
         async with cl.Step(name="🔍 Supervisor analyzing query...", type="run") as pipeline_step:
-            async for event in graph.astream(state_dict, config=config):
-                for node_name, state_update in event.items():
-                    if node_name == "document_gate":
-                        if state_update.get("gate_rejected"):
-                            msg = state_update.get("rejection_message", "Query rejected.")
-                            await cl.Message(content=f"⚠️ {msg}").send()
-                            if session:
-                                session.pipeline_status = "error"
-                                session_store.update(session)
-                            pipeline_step.status = "failed"
+            if conn_string:
+                async with AsyncPostgresSaver.from_conn_string(conn_string) as checkpointer:
+                    await checkpointer.setup()  # creates tables on first run (no-op after)
+                    graph = _build_research_graph(checkpointer=checkpointer)
+                    async for event in graph.astream(state_dict, config=config):
+                        rejected = await _process_stream_event(event, pipeline_step, session, state_dict)
+                        if rejected:
                             return
-
-                    elif node_name == "supervisor":
-                        decision = state_update.get("supervisor_decision")
-                        if decision:
-                            tasks = getattr(decision, "tasks", [])
-                            if not tasks and isinstance(decision, dict):
-                                tasks = decision.get("tasks", [])
-                            task_names = []
-                            for t in tasks:
-                                name = t.get("agent_name", "") if isinstance(t, dict) else getattr(t, "agent_name", "")
-                                if name:
-                                    task_names.append(f"`{name}`")
-                            await cl.Message(
-                                content=f"⚙️ Supervisor assigned: {', '.join(task_names)}. Running agents..."
-                            ).send()
-                            pipeline_step.name = "⚙️ Agents running in parallel..."
-                            await pipeline_step.update()
-
-                    elif node_name == "run_agents":
-                        await cl.Message(content="📝 Agents complete. Synthesis combining results...").send()
-                        pipeline_step.name = "📝 Synthesizing results..."
-                        await pipeline_step.update()
-
-                    elif node_name == "synthesis":
-                        await cl.Message(content="📋 Synthesis complete. Formatting output...").send()
-                        pipeline_step.name = "✅ Pipeline complete!"
-                        pipeline_step.status = "success"
-                        await pipeline_step.update()
-
-                    state_dict.update(state_update)
+            else:
+                async for event in compiled_research_graph.astream(state_dict, config=config):
+                    rejected = await _process_stream_event(event, pipeline_step, session, state_dict)
+                    if rejected:
+                        return
 
         state = ResearchState(**state_dict)
 
