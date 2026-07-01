@@ -10,7 +10,6 @@ agent outputs into the shared state.
 
 from typing import Annotated, Any
 
-from langgraph.graph import MessagesState
 from pydantic import BaseModel
 
 from schemas.agents import (
@@ -74,7 +73,7 @@ class ResearchState(BaseModel):
     report: ResearchReport | None = None
 
     # ── Error tracking & Guardrails ──────────────────────────────────────────
-    errors: list[str] = []
+    errors: Annotated[list[str], _merge_list] = []
     guardrail_rejected: bool = False
     rejection_message: str = ""
     gate_rejected: bool = False
