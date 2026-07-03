@@ -132,6 +132,89 @@ def _retrieve_context(query: str, section_filter: str = "", top_k: int = 6, sess
     except Exception as exc:
         logger.warning("RAG retrieval failed: %s", exc)
         return "", []
+def _generate_answer_with_fallback(messages: list, config: dict) -> tuple[str, Exception | None]:
+    """Helper to try models in AGENT_MODELS['news'] with fallbacks and key rotation."""
+    from agents.base import (
+        AGENT_MODELS, _create_llm, _get_api_key,
+        _is_rate_limit_error, _is_overloaded_error,
+        _rotate_google_key, _classify_error,
+    )
+    model_configs = AGENT_MODELS.get("news", [])
+    answer = ""
+    last_error: Exception | None = None
+
+    # Try up to 2 full cycles of the model fallback chain
+    for cycle in range(2):
+        if cycle > 0:
+            logger.info("Chat agent [cycle %d]: Retrying model chain after Google API key rotation", cycle)
+
+        for i, model_config in enumerate(model_configs):
+            label = "primary" if i == 0 else f"fallback-{i}"
+            if cycle > 0:
+                label += f"-cycle{cycle}"
+
+            # Google: try all available API keys before giving up on this model
+            google_key_attempts = (
+                len(settings.google_api_keys) if model_config.provider == "google" else 1
+            )
+
+            for key_attempt in range(google_key_attempts):
+                api_key = _get_api_key(model_config.provider)
+                if not api_key:
+                    logger.warning(
+                        "Chat agent [%s]: no API key for %s — skipping",
+                        label, model_config.provider,
+                    )
+                    break  # No key → skip this model entirely
+
+                try:
+                    llm = _create_llm(model_config)
+                    response = llm.invoke(messages, config=config)
+                    answer = response.content
+                    logger.info(
+                        "Chat agent [%s]: ✅ answered via %s",
+                        label, model_config.model_id,
+                    )
+                    break  # Success — stop key/model iteration
+
+                except Exception as exc:
+                    error_type = _classify_error(exc)
+                    last_error = exc
+
+                    # Google 429 (rate limit): rotate key and retry same model.
+                    # Google 503 (overloaded): key rotation won't help — skip to next model.
+                    if (
+                        model_config.provider == "google"
+                        and _is_rate_limit_error(exc)
+                        and not _is_overloaded_error(exc)
+                        and key_attempt < google_key_attempts - 1
+                    ):
+                        logger.warning(
+                            "Chat agent [%s]: ❌ rate limit (429) on key %d/%d for %s — rotating key",
+                            label, key_attempt + 1, google_key_attempts, model_config.model_id,
+                        )
+                        _rotate_google_key()
+                        continue  # retry with next Google key
+
+                    # Any other error (503, timeout, connection, etc.): fall through to next model
+                    logger.warning(
+                        "Chat agent [%s]: ❌ %s from %s — trying next model. Error: %s",
+                        label, error_type, model_config.model_id, str(exc)[:200],
+                    )
+                    break  # Exit key-attempt loop → outer loop tries next model
+
+            if answer:
+                break  # Got an answer — exit model loop
+
+        if answer:
+            break  # Got an answer — exit cycle loop
+        else:
+            # If all fallback models failed in the first cycle, rotate Google API key for the next attempt
+            if cycle == 0:
+                logger.warning("Chat agent: all fallback models failed in cycle 0. Rotating Google key and retrying...")
+                _rotate_google_key()
+
+    return answer, last_error
 
 
 def chat(
@@ -239,106 +322,66 @@ def chat(
 
     messages.append(HumanMessage(content=user_msg))
 
-    from agents.base import (
-        AGENT_MODELS, _create_llm, _get_api_key,
-        _is_rate_limit_error, _is_overloaded_error,
-        _rotate_google_key, _classify_error,
-    )
-
-
     config = create_langfuse_config(
         session_id=session_id,
         trace_name="chat-agent",
         use_callbacks=True,
     )
 
-    # ── Fallback chain: try each model in AGENT_MODELS["news"] in order ──────
-    # Any error (429, 503, timeout, connection error) moves to the next model.
-    # For Google models: 429 → rotate API key first and retry same model once
-    # before falling through. 503 (UNAVAILABLE) goes straight to next model.
-    # If all models fail, we rotate the Google API key and retry the entire chain once.
-    model_configs = AGENT_MODELS.get("news", [])
     answer = ""
     last_error: Exception | None = None
+    current_messages = list(messages)
+    attempts = 3
 
-    # Try up to 2 full cycles of the model fallback chain
-    for cycle in range(2):
-        if cycle > 0:
-            logger.info("Chat agent [cycle %d]: Retrying model chain after Google API key rotation", cycle)
+    for attempt in range(attempts):
+        logger.info("Chat agent: generation attempt %d/%d", attempt + 1, attempts)
+        answer, last_error = _generate_answer_with_fallback(current_messages, config)
+        if not answer:
+            break
 
-        for i, model_config in enumerate(model_configs):
-            label = "primary" if i == 0 else f"fallback-{i}"
-            if cycle > 0:
-                label += f"-cycle{cycle}"
+        # Check for hallucinations only if there is retrieval context to verify against
+        if not skip_rag and relevant:
+            try:
+                from tools.chat.hallucination import hallucination_checker
+                check_res = hallucination_checker(answer, full_context)
+                is_grounded = check_res.get("is_grounded", True)
+                ungrounded = check_res.get("ungrounded_claims", [])
 
-            # Google: try all available API keys before giving up on this model
-            google_key_attempts = (
-                len(settings.google_api_keys) if model_config.provider == "google" else 1
-            )
-
-            for key_attempt in range(google_key_attempts):
-                api_key = _get_api_key(model_config.provider)
-                if not api_key:
+                if is_grounded:
+                    logger.info("Chat agent: answer grounded successfully on attempt %d", attempt + 1)
+                    break
+                else:
                     logger.warning(
-                        "Chat agent [%s]: no API key for %s — skipping",
-                        label, model_config.provider,
+                        "Chat agent: hallucination detected on attempt %d: %d ungrounded claims: %s",
+                        attempt + 1, len(ungrounded), ungrounded
                     )
-                    break  # No key → skip this model entirely
-
-                try:
-                    llm = _create_llm(model_config)
-                    response = llm.invoke(messages, config=config)
-                    answer = response.content
-                    logger.info(
-                        "Chat agent [%s]: ✅ answered via %s",
-                        label, model_config.model_id,
-                    )
-                    break  # Success — stop key/model iteration
-
-                except Exception as exc:
-                    error_type = _classify_error(exc)
-                    last_error = exc
-
-                    # Google 429 (rate limit): rotate key and retry same model.
-                    # Google 503 (overloaded): key rotation won't help — skip to next model.
-                    if (
-                        model_config.provider == "google"
-                        and _is_rate_limit_error(exc)
-                        and not _is_overloaded_error(exc)
-                        and key_attempt < google_key_attempts - 1
-                    ):
-                        logger.warning(
-                            "Chat agent [%s]: ❌ rate limit (429) on key %d/%d for %s — rotating key",
-                            label, key_attempt + 1, google_key_attempts, model_config.model_id,
-                        )
-                        _rotate_google_key()
-                        continue  # retry with next Google key
-
-                    # Any other error (503, timeout, connection, etc.): fall through to next model
-                    logger.warning(
-                        "Chat agent [%s]: ❌ %s from %s — trying next model. Error: %s",
-                        label, error_type, model_config.model_id, str(exc)[:200],
-                    )
-                    break  # Exit key-attempt loop → outer loop tries next model
-
-            if answer:
-                break  # Got an answer — exit model loop
-
-        if answer:
-            break  # Got an answer — exit cycle loop
+                    if attempt < attempts - 1:
+                        # Append the hallucinated answer and a correction instruction to the conversation context
+                        current_messages.append(AIMessage(content=answer))
+                        claims_str = ", ".join(f"'{c}'" for c in ungrounded)
+                        current_messages.append(HumanMessage(
+                            content=(
+                                f"Your previous answer contained claims not supported by the provided context: {claims_str}.\n"
+                                f"Please rewrite the answer. Ensure every single statement you make is directly "
+                                f"supported by the context. Do not extrapolate, assume, or make up facts."
+                            )
+                        ))
+                        # Continue to next attempt
+                        continue
+            except Exception as e:
+                logger.warning("Chat agent: hallucination check failed: %s — accepting current answer", e)
+                break
         else:
-            # If all fallback models failed in the first cycle, rotate Google API key for the next attempt
-            if cycle == 0:
-                logger.warning("Chat agent: all fallback models failed in cycle 0. Rotating Google key and retrying...")
-                _rotate_google_key()
-
+            # Conversational/generic chitchat (no source context loaded)
+            break
 
     if not answer:
-        logger.error("Chat agent: all models failed. Last error: %s", last_error)
+        logger.error("Chat agent: all attempts/models failed. Last error: %s", last_error)
         answer = (
             "I'm sorry, I encountered an error generating a response. "
             "Please try again in a moment."
         )
+
 
     # ── 5. Update session history ────────────────────────────────────
     history.append(HumanMessage(content=question))
